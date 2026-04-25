@@ -1,0 +1,565 @@
+# Argentina ticker map.
+#
+# Notes specific to Argentina:
+# - CPI history has structural breaks (INDEC pre-2007, IPC-CABA / IPC-Congreso bridges, post-2017 INDEC).
+#   The pipeline keeps levels but flags YoY rates >100% so charts can switch axes.
+# - FX has multiple parallel rates: official (BCRA A3500), MEP (AL30/GD30 cash mkt), CCL (blue chip swap),
+#   blue (informal). Pipeline computes brecha (gap) vs official.
+# - Fiscal: tracks both Tesoro Nacional primary balance and SPN (sector publico nacional).
+#
+# Verify Haver DB code against your subscription. ARGENT is the standard.
+# For BCRA daily series, EMERGE and BCRA databases also work.
+
+country: Argentina
+iso: AR
+currency: ARS
+
+series:
+
+  # ─────────────────────── MONTHLY ───────────────────────
+  - name: cpi_headline_yoy
+    label: "CPI national, YoY"
+    provider: haver
+    ticker: c213cpi@argent
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: cpi_headline_mom
+    label: "CPI national, MoM"
+    provider: haver
+    ticker: c213cpi@argent
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: mom
+    chart: true
+
+  - name: cpi_core_yoy
+    label: "CPI núcleo, YoY"
+    provider: haver
+    ticker: c213cpx@argent
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: cpi_regulated_yoy
+    label: "CPI regulados, YoY"
+    provider: haver
+    ticker: c213cpr@argent
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: yoy
+    chart: false
+
+  - name: emae
+    label: "EMAE monthly activity, YoY"
+    provider: haver
+    ticker: c213ema@argent
+    frequency: M
+    tab: monthly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: industrial_production_ipi
+    label: "Industrial production (IPI), YoY"
+    provider: haver
+    ticker: c213ipi@argent
+    frequency: M
+    tab: monthly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: construction_isac
+    label: "Construction (ISAC), YoY"
+    provider: haver
+    ticker: c213isac@argent
+    frequency: M
+    tab: monthly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: unemployment_rate
+    label: "Unemployment rate (urban)"
+    provider: haver
+    ticker: c213une@argent
+    frequency: Q   # INDEC EPH is quarterly
+    tab: monthly
+    category: labor
+    units: pct
+    transform: level
+    chart: true
+
+  - name: trade_balance
+    label: "Trade balance, USD mn"
+    provider: haver
+    ticker: c213tba@argent
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: exports_total
+    label: "Exports, USD mn"
+    provider: haver
+    ticker: c213exp@argent
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: false
+
+  - name: imports_total
+    label: "Imports, USD mn"
+    provider: haver
+    ticker: c213imp@argent
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: false
+
+  - name: bcra_reserves_gross
+    label: "BCRA gross reserves, USD bn"
+    provider: haver
+    ticker: c213res@argent
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: bcra_reserves_net
+    label: "BCRA net reserves, USD bn (est.)"
+    provider: haver
+    ticker: c213resn@argent
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: policy_rate_leliq
+    label: "BCRA policy rate (Leliq / TPM)"
+    provider: haver
+    ticker: c213mpr@argent
+    frequency: M
+    tab: monthly
+    category: monetary
+    units: yield
+    transform: level
+    chart: true
+
+  - name: monetary_base
+    label: "Monetary base, ARS bn"
+    provider: haver
+    ticker: c213bm@argent
+    frequency: M
+    tab: monthly
+    category: monetary
+    units: money_lcy_bn
+    transform: level
+    chart: true
+
+  - name: m2_private
+    label: "M2 private, ARS bn"
+    provider: haver
+    ticker: c213m2@argent
+    frequency: M
+    tab: monthly
+    category: monetary
+    units: money_lcy_bn
+    transform: level
+    chart: false
+
+  - name: fiscal_primary_balance
+    label: "Tesoro primary balance, ARS bn (12m roll)"
+    provider: haver
+    ticker: c213fisp@argent
+    frequency: M
+    tab: monthly
+    category: fiscal
+    units: money_lcy_bn
+    transform: level
+    chart: true
+
+  - name: fiscal_overall_balance
+    label: "Tesoro overall balance, ARS bn (12m roll)"
+    provider: haver
+    ticker: c213fis@argent
+    frequency: M
+    tab: monthly
+    category: fiscal
+    units: money_lcy_bn
+    transform: level
+    chart: true
+
+  - name: tax_collection
+    label: "AFIP tax collection, YoY real"
+    provider: haver
+    ticker: c213tax@argent
+    frequency: M
+    tab: monthly
+    category: fiscal
+    units: pct
+    transform: yoy
+    chart: false
+
+  - name: consumer_confidence_utdt
+    label: "Consumer confidence (UTDT)"
+    provider: haver
+    ticker: c213ucc@argent
+    frequency: M
+    tab: monthly
+    category: surveys
+    units: index
+    transform: level
+    chart: true
+
+  # ─────────────────────── QUARTERLY ───────────────────────
+  - name: gdp_real_yoy
+    label: "Real GDP, YoY"
+    provider: haver
+    ticker: c213gdp@argent
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: gdp_real_qoq_saar
+    label: "Real GDP, QoQ saar"
+    provider: haver
+    ticker: c213gdp@argent
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: saar
+    chart: true
+
+  - name: current_account_pct_gdp
+    label: "Current account, % of GDP (4q roll)"
+    provider: haver
+    ticker: c213cab@argent
+    frequency: Q
+    tab: quarterly
+    category: external
+    units: pct
+    transform: level
+    chart: true
+
+  - name: fdi_inflows
+    label: "FDI inflows, USD bn"
+    provider: haver
+    ticker: c213fdi@argent
+    frequency: Q
+    tab: quarterly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: investment_gfcf
+    label: "Gross fixed capital formation, YoY"
+    provider: haver
+    ticker: c213gfcf@argent
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: private_consumption
+    label: "Private consumption, YoY"
+    provider: haver
+    ticker: c213pcons@argent
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  # ─────────────────────── ANNUAL ───────────────────────
+  - name: gdp_per_capita_usd
+    label: "GDP per capita, USD"
+    provider: haver
+    ticker: c213gdpc@argent
+    frequency: A
+    tab: annual
+    category: activity
+    units: level
+    transform: level
+    chart: true
+
+  - name: external_debt_pct_gdp
+    label: "External debt, % of GDP"
+    provider: haver
+    ticker: c213extd@argent
+    frequency: A
+    tab: annual
+    category: debt
+    units: pct
+    transform: level
+    chart: true
+
+  - name: govt_debt_pct_gdp
+    label: "Total public debt, % of GDP"
+    provider: haver
+    ticker: c213gdebt@argent
+    frequency: A
+    tab: annual
+    category: debt
+    units: pct
+    transform: level
+    chart: true
+
+  - name: imf_outstanding
+    label: "IMF credit outstanding, SDR bn"
+    provider: haver
+    ticker: c213imf@argent
+    frequency: A
+    tab: annual
+    category: debt
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  # ─────────────────────── MARKETS / FX ───────────────────────
+  - name: usdars_official
+    label: "USD/ARS official (BCRA A3500)"
+    provider: bloomberg
+    ticker: USDARS Curncy
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: fx
+    units: fx_local
+    transform: level
+    chart: true
+
+  - name: usdars_mep
+    label: "USD/ARS MEP (AL30D / AL30)"
+    provider: bloomberg
+    ticker: ARSMEP Curncy        # verify; some shops compute from AL30D/AL30
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: fx
+    units: fx_local
+    transform: level
+    chart: true
+
+  - name: usdars_ccl
+    label: "USD/ARS CCL (blue chip swap)"
+    provider: bloomberg
+    ticker: ARSCCL Curncy        # verify; sometimes computed from GD30 ADR / GD30
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: fx
+    units: fx_local
+    transform: level
+    chart: true
+
+  - name: usdars_blue
+    label: "USD/ARS blue (informal)"
+    provider: bloomberg
+    ticker: ARSBLUE Curncy       # placeholder — many use ámbito.com scraper
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: fx
+    units: fx_local
+    transform: level
+    chart: true
+
+  - name: brecha_ccl_official
+    label: "Brecha CCL vs Oficial (%)"
+    provider: derived            # computed from usdars_ccl / usdars_official - 1
+    ticker: ""
+    frequency: D
+    tab: markets
+    category: fx
+    units: pct
+    transform: level
+    chart: true
+
+  - name: merval_usd
+    label: "Merval (USD, CCL-adjusted)"
+    provider: bloomberg
+    ticker: MERVAL Index
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: equity
+    units: index
+    transform: level
+    chart: true
+
+  - name: soybean_cbot
+    label: "Soybean CBOT, USD/bu"
+    provider: bloomberg
+    ticker: S 1 Comdty
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: commodities
+    units: fx_local
+    transform: level
+    chart: true
+
+  # ─────────────────────── CREDIT ───────────────────────
+  # EMBI Global Diversified — Argentina sub-index
+  - name: embi_argentina_spread
+    label: "EMBI GD Argentina, spread (bps)"
+    provider: bloomberg
+    ticker: JPSSARGE Index   # verify against your terminal
+    field: PX_LAST
+    frequency: D
+    tab: credit
+    category: spreads
+    units: bps
+    transform: level
+    chart: true
+
+  - name: embi_argentina_total_return
+    label: "EMBI GD Argentina, total return"
+    provider: bloomberg
+    ticker: JPMEARGE Index   # verify
+    field: PX_LAST
+    frequency: D
+    tab: credit
+    category: total_return
+    units: index
+    transform: level
+    chart: true
+
+  - name: cembi_argentina_spread
+    label: "CEMBI BD Argentina, spread (bps)"
+    provider: bloomberg
+    ticker: JBCDARGE Index   # verify
+    field: PX_LAST
+    frequency: D
+    tab: credit
+    category: spreads
+    units: bps
+    transform: level
+    chart: true
+
+  # 2020 restructured Globals (USD New York law). Verify exact tickers.
+  - name: gd29
+    label: "ARGENT 1.000 07/29 (GD29)"
+    provider: bloomberg
+    ticker: BX1234567 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 4
+
+  - name: gd30
+    label: "ARGENT 0.750 07/30 (GD30)"
+    provider: bloomberg
+    ticker: BX2345678 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 5
+
+  - name: gd35
+    label: "ARGENT 1.125 07/35 (GD35)"
+    provider: bloomberg
+    ticker: BX3456789 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 10
+
+  - name: gd38
+    label: "ARGENT 0.125 01/38 (GD38)"
+    provider: bloomberg
+    ticker: BX4567890 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 13
+
+  - name: gd41
+    label: "ARGENT 1.125 07/41 (GD41)"
+    provider: bloomberg
+    ticker: BX5678901 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 16
+
+  - name: gd46
+    label: "ARGENT 0.125 07/46 (GD46)"
+    provider: bloomberg
+    ticker: BX6789012 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 21
+
+  # YPF as quasi-sovereign benchmark (optional but useful for ARG calls)
+  - name: ypf_2031
+    label: "YPF 8.50 31"
+    provider: bloomberg
+    ticker: BX7890123 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: corporate_benchmark
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 7

@@ -1,0 +1,49 @@
+# Global settings — paths, history, refresh behavior
+
+paths:
+  cache: cache
+  outputs: outputs
+  logs: logs
+
+history:
+  # how far back to pull on first run
+  default_start: "2005-01-01"
+  # high-frequency markets/credit limited to N years for speed
+  markets_start: "2015-01-01"
+  credit_start: "2018-01-01"
+
+refresh:
+  # treat cache as stale if older than N hours; below this threshold,
+  # refresh_all uses last close in cache and only top-up most recent days
+  stale_after_hours: 18
+  # always pull last N business days fresh on every refresh (handles revisions)
+  always_repull_days: 30
+
+excel:
+  # number formatting per series category
+  number_formats:
+    pct: '0.00%'
+    pct_pp: '+0.00"pp";-0.00"pp"'
+    bps: '#,##0" bps"'
+    yield: '0.00"%"'
+    fx_local: '#,##0.00'
+    money_usd_bn: '#,##0.0," USD bn"'
+    money_lcy_bn: '#,##0.0," lcy bn"'
+    index: '#,##0.0'
+    level: '#,##0'
+
+  # consistent palette across both countries
+  palette:
+    primary: '1F4E79'      # deep blue (header / lines)
+    accent: 'C00000'       # red (risk / spread)
+    positive: '548235'     # green (positive surprise)
+    neutral: '7F7F7F'      # grey (secondary)
+    band: 'D9E1F2'         # light blue (range fill)
+  # Chile/Argentina country tints (used in dashboard, chart titles)
+  country_tints:
+    chile: 'C8102E'        # Chile flag red
+    argentina: '74ACDF'    # Argentina flag light blue
+
+dashboard:
+  default_country: chile
+  default_panel: monthly

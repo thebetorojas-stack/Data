@@ -1,0 +1,445 @@
+# Chile ticker map.
+#
+# provider: bloomberg | haver
+# frequency: D | M | Q | A
+# transform: level | yoy | mom | qoq | saar  (computed in pipeline if set)
+# tab: monthly | quarterly | annual | credit | markets
+# Haver tickers use the form <code>@<database>. Verify DB code matches your subscription.
+# Bloomberg tickers use the form "<TICKER> <YELLOW KEY>".
+
+country: Chile
+iso: CL
+currency: CLP
+
+series:
+
+  # ─────────────────────── MONTHLY ───────────────────────
+  - name: cpi_headline_yoy
+    label: "CPI headline, YoY"
+    provider: haver
+    ticker: c917cpi@chile
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: cpi_core_yoy
+    label: "CPI core (ex food & energy), YoY"
+    provider: haver
+    ticker: c917cpx@chile
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: cpi_mom_sa
+    label: "CPI MoM, sa"
+    provider: haver
+    ticker: c917cpi@chile
+    frequency: M
+    tab: monthly
+    category: prices
+    units: pct
+    transform: mom
+    chart: false
+
+  - name: imacec
+    label: "IMACEC monthly activity, YoY"
+    provider: haver
+    ticker: c917ima@chile
+    frequency: M
+    tab: monthly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: industrial_production
+    label: "Industrial production, YoY"
+    provider: haver
+    ticker: c917ind@chile
+    frequency: M
+    tab: monthly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: retail_sales
+    label: "Retail sales, YoY"
+    provider: haver
+    ticker: c917rtv@chile
+    frequency: M
+    tab: monthly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: unemployment_rate
+    label: "Unemployment rate"
+    provider: haver
+    ticker: c917une@chile
+    frequency: M
+    tab: monthly
+    category: labor
+    units: pct
+    transform: level
+    chart: true
+
+  - name: trade_balance
+    label: "Trade balance, USD mn"
+    provider: haver
+    ticker: c917tba@chile
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: exports_total
+    label: "Exports, USD mn"
+    provider: haver
+    ticker: c917exp@chile
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: false
+
+  - name: imports_total
+    label: "Imports, USD mn"
+    provider: haver
+    ticker: c917imp@chile
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: false
+
+  - name: international_reserves
+    label: "International reserves, USD bn"
+    provider: haver
+    ticker: c917res@chile
+    frequency: M
+    tab: monthly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: policy_rate_tpm
+    label: "Policy rate (TPM)"
+    provider: haver
+    ticker: c917mpr@chile
+    frequency: M
+    tab: monthly
+    category: monetary
+    units: yield
+    transform: level
+    chart: true
+
+  - name: m1
+    label: "M1, CLP bn"
+    provider: haver
+    ticker: c917m1@chile
+    frequency: M
+    tab: monthly
+    category: monetary
+    units: money_lcy_bn
+    transform: level
+    chart: false
+
+  - name: m3
+    label: "M3, CLP bn"
+    provider: haver
+    ticker: c917m3@chile
+    frequency: M
+    tab: monthly
+    category: monetary
+    units: money_lcy_bn
+    transform: level
+    chart: false
+
+  - name: business_confidence_imce
+    label: "Business confidence (IMCE)"
+    provider: haver
+    ticker: c917imc@chile
+    frequency: M
+    tab: monthly
+    category: surveys
+    units: index
+    transform: level
+    chart: true
+
+  - name: consumer_confidence_ipec
+    label: "Consumer confidence (IPEC)"
+    provider: haver
+    ticker: c917ipc@chile
+    frequency: M
+    tab: monthly
+    category: surveys
+    units: index
+    transform: level
+    chart: true
+
+  - name: fiscal_balance_central_govt
+    label: "Central govt balance, % of GDP (12m roll)"
+    provider: haver
+    ticker: c917fis@chile
+    frequency: M
+    tab: monthly
+    category: fiscal
+    units: pct
+    transform: level
+    chart: true
+
+  # ─────────────────────── QUARTERLY ───────────────────────
+  - name: gdp_real_yoy
+    label: "Real GDP, YoY"
+    provider: haver
+    ticker: c917gdp@chile
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  - name: gdp_real_qoq_saar
+    label: "Real GDP, QoQ saar"
+    provider: haver
+    ticker: c917gdp@chile
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: saar
+    chart: true
+
+  - name: current_account_pct_gdp
+    label: "Current account, % of GDP (4q roll)"
+    provider: haver
+    ticker: c917cab@chile
+    frequency: Q
+    tab: quarterly
+    category: external
+    units: pct
+    transform: level
+    chart: true
+
+  - name: fdi_inflows
+    label: "FDI inflows, USD bn"
+    provider: haver
+    ticker: c917fdi@chile
+    frequency: Q
+    tab: quarterly
+    category: external
+    units: money_usd_bn
+    transform: level
+    chart: true
+
+  - name: gross_fixed_capital_formation
+    label: "GFCF, YoY"
+    provider: haver
+    ticker: c917gfcf@chile
+    frequency: Q
+    tab: quarterly
+    category: activity
+    units: pct
+    transform: yoy
+    chart: true
+
+  # ─────────────────────── ANNUAL ───────────────────────
+  - name: gdp_per_capita_usd
+    label: "GDP per capita, USD"
+    provider: haver
+    ticker: c917gdpc@chile
+    frequency: A
+    tab: annual
+    category: activity
+    units: level
+    transform: level
+    chart: true
+
+  - name: external_debt_pct_gdp
+    label: "External debt, % of GDP"
+    provider: haver
+    ticker: c917extd@chile
+    frequency: A
+    tab: annual
+    category: debt
+    units: pct
+    transform: level
+    chart: true
+
+  - name: govt_debt_pct_gdp
+    label: "General govt debt, % of GDP"
+    provider: haver
+    ticker: c917gdebt@chile
+    frequency: A
+    tab: annual
+    category: debt
+    units: pct
+    transform: level
+    chart: true
+
+  # ─────────────────────── MARKETS (daily, summarized monthly) ───────────────────────
+  - name: usdclp
+    label: "USD/CLP"
+    provider: bloomberg
+    ticker: USDCLP Curncy
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: fx
+    units: fx_local
+    transform: level
+    chart: true
+
+  - name: copper_lme
+    label: "LME copper, USD/lb"
+    provider: bloomberg
+    ticker: HG1 Comdty
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: commodities
+    units: fx_local
+    transform: level
+    chart: true
+
+  - name: ipsa
+    label: "IPSA equity index"
+    provider: bloomberg
+    ticker: IPSA Index
+    field: PX_LAST
+    frequency: D
+    tab: markets
+    category: equity
+    units: index
+    transform: level
+    chart: true
+
+  - name: clp_10y_yield
+    label: "Chile 10Y local rate"
+    provider: bloomberg
+    ticker: GTCLP10Y Govt
+    field: YLD_YTM_MID
+    frequency: D
+    tab: markets
+    category: rates
+    units: yield
+    transform: level
+    chart: true
+
+  # ─────────────────────── CREDIT ───────────────────────
+  # EMBI Global Diversified — Chile country sub-index
+  - name: embi_chile_spread
+    label: "EMBI GD Chile, spread (bps)"
+    provider: bloomberg
+    ticker: JPSSCHIL Index   # verify against your terminal
+    field: PX_LAST
+    frequency: D
+    tab: credit
+    category: spreads
+    units: bps
+    transform: level
+    chart: true
+
+  - name: embi_chile_total_return
+    label: "EMBI GD Chile, total return"
+    provider: bloomberg
+    ticker: JPMECHIL Index   # verify
+    field: PX_LAST
+    frequency: D
+    tab: credit
+    category: total_return
+    units: index
+    transform: level
+    chart: true
+
+  - name: cembi_chile_spread
+    label: "CEMBI BD Chile, spread (bps)"
+    provider: bloomberg
+    ticker: JBCDCHIL Index   # verify
+    field: PX_LAST
+    frequency: D
+    tab: credit
+    category: spreads
+    units: bps
+    transform: level
+    chart: true
+
+  # USD-denominated sovereign bonds (verify ISINs / Bloomberg tickers in your environment)
+  - name: chile_usd_2027
+    label: "CHILE 2.55 27"
+    provider: bloomberg
+    ticker: EJ4523833 Corp     # placeholder — replace with your bond ticker
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 4
+
+  - name: chile_usd_2031
+    label: "CHILE 2.55 31"
+    provider: bloomberg
+    ticker: EK0989041 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 8
+
+  - name: chile_usd_2034
+    label: "CHILE 3.50 34"
+    provider: bloomberg
+    ticker: EK1234567 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 11
+
+  - name: chile_usd_2042
+    label: "CHILE 3.10 42"
+    provider: bloomberg
+    ticker: EK2345678 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 19
+
+  - name: chile_usd_2050
+    label: "CHILE 3.50 50"
+    provider: bloomberg
+    ticker: EK3456789 Corp     # placeholder
+    field: YLD_YTM_MID
+    frequency: D
+    tab: credit
+    category: usd_curve
+    units: yield
+    transform: level
+    chart: false
+    curve_maturity_years: 27
