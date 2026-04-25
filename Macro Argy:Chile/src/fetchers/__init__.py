@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .base import Fetcher, FetchResult
 from .bloomberg import BloombergFetcher
 from .haver import HaverFetcher
