@@ -1,41 +1,91 @@
-# Macro & Hard-Currency Credit — Chile / Argentina
+# Macro Tracker — multi-country
 
-Two self-updating Excel workbooks driven by Bloomberg formulas. **No Python required.**
+A self-refreshing Excel workbook per country, covering GDP, Inflation, Fiscal, Balance of Payments, and Reserves. You edit one sheet (Codes) per country. One command (`python refresh.py`) repopulates everything — data, growth metrics, 2-year forecasts, and charts.
 
-## What's in this folder
+Currently configured: **Argentina** and **Chile**. Adding a third country is one CSV file.
 
-- `Chile.xlsx` — macro + credit + markets, all tabs, native Excel charts
-- `Argentina.xlsx` — same structure for Argentina
-- `EMBI_Fair_Value_Model.xlsx` — top-down regression + bottom-up country attribution model for the EMBI Global Diversified spread (3m / 6m / 12m forecasts)
-- `_python_version_optional/` — the older Python+Streamlit version, kept here as a backup option only. Ignore unless you specifically want it later.
+## What you get
 
-## How to use
+One workbook per country (`Macro_Tracker_Argentina.xlsx`, `Macro_Tracker_Chile.xlsx`), each with these tabs:
 
-1. Make sure Bloomberg Terminal is open and you're logged in.
-2. Open `Chile.xlsx` (or `Argentina.xlsx`).
-3. On the **Bloomberg** tab in the Excel ribbon, click **Refresh Workbook** (or just press F9). Data + charts update in place.
-4. That's it. Email the workbook to whoever needs it — the charts retain the last refresh, so recipients without Bloomberg still see your numbers and charts.
+- **README** — in-workbook quick reference.
+- **Codes** — the only thing you ever edit. One row per indicator. Yellow cells = inputs.
+- **GDP / Inflation / Fiscal / BoP / Reserves** — one tab per category. Each indicator on the Codes sheet gets its own block on the matching tab: a quarterly Table (Date, Level, QoQ %, YoY %, Linear Forecast, Holt-Winters Forecast), an annual Table (Year, Level, YoY %, Forecast), and a chart that overlays history with both forecasts.
+- **Dashboard** — one row per indicator: latest value, latest YoY %, 2-year forecast, source.
 
-## What's in each workbook
+The data and forecast tables are real Excel Tables (ListObjects), and the charts reference Table columns. When `refresh.py` rewrites them, the charts pick up the new range automatically — no chart fiddling, ever.
 
-Seven tabs:
+## The minimal workflow
 
-- **Read me** — the same instructions as above, inside the file.
-- **Monthly** — CPI, activity (IMACEC/EMAE), industrial production, retail sales, unemployment, trade balance, reserves, policy rate, fiscal monthly. Charts in a 2-column grid below the data.
-- **Quarterly** — real GDP YoY, GDP QoQ saar, current account % GDP, investment (GFCF), private consumption.
-- **Annual** — GDP per capita USD, total public debt % GDP, external debt % GDP.
-- **Credit** — EMBI country spread, CEMBI country spread, EMBI total return, three points on the USD sovereign curve (5Y / 10Y / 30Y for Chile; GD30 / GD35 / GD41 for Argentina).
-- **Markets** — FX, equity index, key commodity (copper for Chile, soybeans for Argentina), 10Y local rate.
-- **Tickers** — every series and its Bloomberg ticker on one filterable list. Edit a ticker here, refresh, the chart updates. This is your one place to swap things out.
+1. Open `Macro_Tracker_Argentina.xlsx` (or `_Chile`).
+2. Edit the **Codes** sheet — change a Haver code, add/remove a row.
+3. Save and close.
+4. Run `python refresh.py` (rebuilds both countries) or `python refresh.py argentina` (just one).
+5. Reopen the workbook. Every tab is current.
 
-## Verifying / fixing tickers
+To add a third country: drop a `codes_<name>.csv` next to `refresh.py`. It'll be picked up automatically.
 
-Every cell with `=BDH(...)` is a normal Excel formula. If a series shows `#N/A` or a wrong number, it's almost always one of:
+## Codes sheet schema
 
-- Ticker is slightly off for your subscription / region. Open Bloomberg, type `ECO <GO>` for macro indicators or `SECF <GO>` for securities, find the right ticker, paste it on the **Tickers** tab.
-- Field name is wrong (`PX_LAST` vs `YLD_YTM_MID`). The Tickers tab shows which field is being used per row.
-- History parameter is too aggressive. The formulas pull from 2000–2018 depending on frequency; if a series only goes back to 2018, the older years just return blank — that's normal.
+| Column | Notes |
+| --- | --- |
+| Section | Must be one of GDP, Inflation, Fiscal, BoP, Reserves. Drives which tab the indicator lands on. |
+| Indicator | Display name (becomes the block title and chart title). |
+| Country | Free text. Useful when you track multiple countries. |
+| Frequency | D / W / M / Q / A — your hint about the native frequency. |
+| Quarterly Code | Haver code for the quarterly view. |
+| Annual Code | Haver code for the annual view. Optional — if blank the workbook aggregates from the quarterly. |
+| Units | Free text, surfaces in the block header and chart Y-axis. |
+| Notes | Free text. |
 
-## Why no Python anymore
+## Aggregation rules
 
-The Python+Streamlit version had nice features (auto-cache, dashboard, programmatic refresh), but on a locked-down corporate machine with restricted Python and gated package installs, it's more friction than it's worth. The Excel + BDH approach gives you the same charts, same data, refreshes with one click, and uses tools you already have running on the machine. If you ever want the dashboard back, the full Python version is preserved in `_python_version_optional/`.
+Higher-frequency series get rolled up automatically:
+
+- **GDP / Inflation** — averaged across periods (the right rule for SAAR levels and price indices).
+- **Fiscal flows / BoP flows** — summed across periods.
+- **Stocks (Federal Debt, Reserves)** — last value of period.
+
+If you ever need to override one of these, change the Indicator name to include the right keyword (`debt`, `index`, `deflator`) — the override list is at the top of `macro_tracker.py`.
+
+## Forecast methods
+
+Both run on the quarterly series, then the annual forecast is aggregated from the quarterly:
+
+- **Linear trend** — log-linear regression on the full history (positive series) or OLS on levels (deficit/CA series). Extends 8 quarters.
+- **Holt-Winters** — additive damped-trend exponential smoothing, with seasonal terms when history allows. 95% bands are residual-σ × √h.
+
+## Setup
+
+```bash
+pip install pandas numpy openpyxl
+pip install statsmodels   # optional, upgrades the Holt-Winters fit; pure-numpy fallback otherwise
+pip install haver         # Windows only — needs Haver DLX installed locally with a valid licence
+```
+
+## Data sources, in order
+
+`refresh.py` tries each, uses whichever works:
+
+1. **Haver DLX** via the `haver` Python package. Requires DLX installed locally (Windows + Haver subscription).
+2. **CSV fallback** — drop `data/<CODE>.csv` (`date,value`) for any code. Lets Mac/Linux users iterate without DLX.
+3. **Synthetic demo** — plausible-looking values per indicator family. The Source column on the Dashboard shows which path each indicator took, and the README section title in the workbook flags the demo.
+
+## Notes for Argentina & Chile
+
+The starter Haver codes in `codes_argentina.csv` and `codes_chile.csv` are best-guess mnemonics following Haver's IFS-style country-code conventions (Argentina = 213, Chile = 228). Every row is tagged `[VERIFY]` in Notes — please confirm each one in your Haver subscription before relying on the numbers. The structure of the workbook will work regardless; only the data fetch depends on the codes being correct.
+
+For Argentina specifically, the linear-trend forecast is fitted on the **last 40 quarters only** (configurable in `macro_tracker.py`), so structural breaks like the 2007–2015 INDEC suspension or recent inflation regime changes don't poison the projection. Holt-Winters still uses the full history. Even so, expect inflation forecasts to be wide — that's a feature, not a bug, given the underlying volatility.
+
+## Files in this folder
+
+| File | Purpose |
+| --- | --- |
+| `Macro_Tracker_Argentina.xlsx` | Argentina workbook. Open this to see AR data. |
+| `Macro_Tracker_Chile.xlsx` | Chile workbook. Open this to see CL data. |
+| `codes_argentina.csv` | Starter codes for Argentina (used on first run; after that the workbook's Codes sheet is the source of truth). |
+| `codes_chile.csv` | Starter codes for Chile. |
+| `refresh.py` | One-command refresh. Bare = both countries; pass `argentina` / `chile` to refresh just one. |
+| `macro_tracker.py` | Workbook builder (categories, blocks, Tables, charts). |
+| `haver_metrics.py` | Fetcher + forecaster. Used by macro_tracker. |
+| `data/` | Optional CSV cache, one file per Haver code. |
