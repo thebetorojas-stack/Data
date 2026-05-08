@@ -49,6 +49,7 @@ import argparse
 import csv
 import math
 import re
+import shutil
 import statistics
 import sys
 from collections import defaultdict
@@ -505,19 +506,76 @@ def merge_snapshots(file_results: List[Tuple[Optional[datetime], Dict[str, Dict[
     """Return (latest_date, latest_data, full_history).
 
     latest_data is what the per-country Snapshot tab uses.
-    full_history is the chronologically-sorted list of every snapshot loaded —
-    consumed by the Rating_Trend tab to show how the universe's average
-    rating moves over time as the user drops more monthly snapshots into
-    the folder.
+    full_history is the chronologically-sorted, DEDUPLICATED-by-date list of
+    every snapshot loaded — consumed by the Rating_Trend tab to show how the
+    universe's average rating moves over time as the user drops more monthly
+    snapshots into the folder.
     """
-    sorted_snaps = sorted(
-        [(d, s) for d, s in file_results if d is not None],
-        key=lambda r: r[0],
-    )
+    # Dedupe by date — if the same snapshot is loaded twice (e.g. once as
+    # 'JP latest.csv' and once as the just-archived 'snapshot_<date>.csv'),
+    # keep the first occurrence only so the time series doesn't double-count.
+    by_date: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
+    for d, s in file_results:
+        if d is None:
+            continue
+        if d not in by_date:
+            by_date[d] = s
+    sorted_snaps = sorted(by_date.items(), key=lambda r: r[0])
     if not sorted_snaps:
         return None, {}, []
     latest_date, latest_data = sorted_snaps[-1]
     return latest_date, latest_data, sorted_snaps
+
+
+def archive_snapshots(input_paths: List[Path], project_dir: Path) -> Tuple[Path, List[Tuple[str, str]]]:
+    """For every input path that is a snapshot file, copy a date-stamped
+    version into `<project_dir>/snapshots_archive/` if not already archived.
+
+    This is the linchpin of the user workflow described in the README:
+    the user always saves their fresh JPM snapshot to the same filename
+    (e.g. 'JP latest.csv'), overwriting the previous one. Without archiving,
+    every re-run would lose all prior snapshots — the user reported exactly
+    this problem on their work computer. Archiving makes history accumulate
+    automatically; the user never has to manually rename anything.
+
+    Returns: (archive_dir_path_or_None, list_of_newly_archived_files).
+    Returns None for the path if the project directory is read-only.
+    """
+    archive_dir = project_dir / "snapshots_archive"
+    try:
+        archive_dir.mkdir(exist_ok=True)
+    except (OSError, PermissionError) as exc:
+        print(f"\n  WARNING: cannot create '{archive_dir}' ({exc}). "
+              f"Snapshot auto-archiving is disabled for this run. "
+              f"Run from a writable folder if you want history preserved.",
+              file=sys.stderr)
+        return None, []
+    newly_archived: List[Tuple[str, str]] = []
+    for path in input_paths:
+        # Don't archive files that already live inside the archive folder.
+        try:
+            if archive_dir in path.resolve().parents:
+                continue
+        except (OSError, RuntimeError):
+            pass
+        if classify_csv(path) != "snapshot":
+            continue
+        try:
+            snap_date, _ = load_snapshot(path)
+        except Exception:
+            continue
+        if snap_date is None:
+            continue
+        archive_name = f"snapshot_{snap_date.strftime('%Y-%m-%d')}.csv"
+        archive_path = archive_dir / archive_name
+        if not archive_path.exists():
+            try:
+                shutil.copy2(path, archive_path)
+                newly_archived.append((snap_date.strftime("%Y-%m-%d"), archive_name))
+            except (OSError, PermissionError) as exc:
+                print(f"  WARNING: failed to archive {path.name}: {exc}",
+                      file=sys.stderr)
+    return archive_dir, newly_archived
 
 
 # ============================================================================
@@ -538,12 +596,22 @@ class Builder:
     ) -> None:
         self.dates = dates
         self.series = series
-        self.weight_dates = weight_dates
-        self.weight_series = weight_series
         self.snap_date = snap_date
         self.snap_data = snap_data
         self.snap_history = snap_history  # list of (date, data) tuples
         self.sources = sources
+
+        # ---- Merge snapshot-derived weights into the weights time series ----
+        # Each snapshot file has 'Mkt Cap %' per country, which is the weight
+        # at the snapshot date. As the user accumulates snapshots over time
+        # (via auto-archive), these add fresh data points to the time series.
+        # On any date where we have BOTH a weights-history entry AND a snapshot,
+        # the snapshot wins (it's the more recent, more authoritative source).
+        merged_dates, merged_series = self._merge_snapshot_weights(
+            weight_dates, weight_series, snap_history
+        )
+        self.weight_dates = merged_dates
+        self.weight_series = merged_series
 
         self.frequency = self._detect_frequency(dates)
         self.wb = Workbook()
@@ -568,6 +636,52 @@ class Builder:
         self.ratings_present: List[str] = [r for r in RATING_ORDER if r in present]
 
     # --------- helpers ----------
+    @staticmethod
+    def _merge_snapshot_weights(
+        weight_dates: List[datetime],
+        weight_series: Dict[str, List[Optional[float]]],
+        snap_history: List[Tuple[datetime, Dict[str, Dict[str, Any]]]],
+    ) -> Tuple[List[datetime], Dict[str, List[Optional[float]]]]:
+        """Combine the weights-history file with per-country weights extracted
+        from each snapshot (the 'Mkt Cap %' field per country).
+
+        The weights-history file gives long monthly history (back to 1993).
+        Each snapshot adds one fresh data point per country at the snapshot
+        date. On overlapping dates, the snapshot wins. The output covers the
+        union of all dates from both sources.
+        """
+        # Normalize the weights-history into a {country: {date: weight}} dict.
+        merged: Dict[str, Dict[datetime, float]] = defaultdict(dict)
+        for c, vals in weight_series.items():
+            for i, d in enumerate(weight_dates):
+                v = vals[i]
+                if v is not None:
+                    merged[c][d] = v
+
+        # Layer snapshot weights on top — they override on overlap.
+        for snap_date, snap_data in snap_history:
+            for ent, data in snap_data.items():
+                if not isinstance(ent, str) or ent.startswith(("REGION:", "INDEX:", "AGG:")):
+                    continue
+                raw = (data.get("Mkt Cap %") or "").strip()
+                if not raw:
+                    continue
+                try:
+                    w = float(raw)
+                except ValueError:
+                    continue
+                merged[ent][snap_date] = w
+
+        if not merged:
+            return [], {}
+
+        # Re-flatten back into (sorted_dates, {country: [values per date]}).
+        all_dates = sorted({d for c_data in merged.values() for d in c_data})
+        out_series: Dict[str, List[Optional[float]]] = {
+            c: [merged[c].get(d) for d in all_dates] for c in merged
+        }
+        return all_dates, out_series
+
     @staticmethod
     def _detect_frequency(dates: List[datetime]) -> str:
         if len(dates) < 2:
@@ -738,7 +852,36 @@ class Builder:
             ("Workflow in one line",
              "Drop fresh JPM CSVs into your project folder, open a terminal in that folder, run "
              "`python embi_builder.py` — done. The workbook regenerates with all the data the script "
-             "can find."),
+             "can find. HISTORY IS PRESERVED automatically (see 'How history is preserved' below)."),
+            ("","",),
+            ("Recommended workflow: 'JP latest' file",
+             "When you download a fresh JPM SNAPSHOT, save it as 'JP latest.csv' in this folder, "
+             "overwriting any previous file with that name. Then run `python embi_builder.py`. The "
+             "script will: (a) detect that 'JP latest.csv' is a snapshot file (by inspecting the "
+             "header), (b) read the snapshot's date from inside the file, (c) copy a date-stamped "
+             "version into a 'snapshots_archive/' subfolder (e.g. 'snapshot_2026-05-22.csv'), "
+             "(d) regenerate the workbook using ALL archived snapshots plus the latest one. The "
+             "filename 'JP latest.csv' is just a convenience — call it whatever you want, the "
+             "script classifies by content, not by filename."),
+            ("How history is preserved",
+             "The snapshot file is the only single-date file type, so it's the only one at risk of "
+             "history loss when overwritten. The script handles this for you: every time you run, "
+             "it looks for snapshot files in the project folder, reads each one's snapshot date "
+             "from inside the CSV, and copies a date-stamped duplicate into 'snapshots_archive/' "
+             "if one isn't already there. The archive grows monotonically — older snapshots are "
+             "NEVER deleted. The next time you run, the script reads from BOTH the project folder "
+             "AND the archive, so all your historical snapshots feed into the workbook. You can "
+             "freely overwrite 'JP latest.csv' without losing any data. Returns and weights-history "
+             "files self-preserve because JPM ships them with full history each time, but if you "
+             "want extra safety you can also save copies to the archive folder manually."),
+            ("Snapshot weights also feed the time series",
+             "Each snapshot file contains per-country 'Mkt Cap %' (= weight in the index at the "
+             "snapshot date). The script extracts these and merges them with the weights-history "
+             "file. On overlapping dates the snapshot wins (it's the most authoritative). As you "
+             "accumulate snapshots, the weight time series gets a fresh data point at each snapshot "
+             "date, both for the Weights tab (latest values) and the Weights_History tab (full "
+             "trajectory). You don't need to download a new weights-history file every month — "
+             "snapshots alone keep your weight data current."),
             ("",""),
             ("Required files (download from JPM)",
              "Three file types power this workbook. You don't need all three every time, but you do "
@@ -2684,6 +2827,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not paths:
         print("ERROR: no CSV files found", file=sys.stderr)
         return 1
+
+    # ---- Snapshot auto-archive ----
+    # Determine the project folder (where the user is running from / pointing at).
+    if args.inputs:
+        first = Path(args.inputs[0]).expanduser().resolve()
+        project_dir = first if first.is_dir() else first.parent
+    else:
+        project_dir = Path.cwd()
+    archive_dir, newly_archived = archive_snapshots(paths, project_dir)
+    if newly_archived:
+        print(f"\n  Archived snapshots to {archive_dir}:")
+        for d, name in newly_archived:
+            print(f"    [{d}]  {name}")
+    # Always include archived snapshots in the load — even if the user runs
+    # the script with explicit file arguments that don't include them.
+    if archive_dir is not None and archive_dir.exists():
+        archive_csvs = sorted(archive_dir.glob("*.csv"))
+        seen = {p.resolve() for p in paths}
+        for p in archive_csvs:
+            if p.resolve() not in seen:
+                paths.append(p)
 
     returns_results = []
     weights_results = []
