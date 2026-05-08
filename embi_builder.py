@@ -447,8 +447,12 @@ def load_snapshot(path: Path) -> Tuple[Optional[datetime], Dict[str, Dict[str, A
             key = f"REGION:{SNAPSHOT_REGION_LABEL[instrument]}"
         elif instrument == "Non Latin":
             key = "AGG:NonLatin"
-        elif instrument == "EMBI Global Diversified":
-            key = "INDEX:EMBIGD"
+        elif instrument in ("EMBI Global", "EMBI Global Diversified"):
+            # Either flavor of the index gets unified under the same internal
+            # key. In normal use the user downloads EMBI Global (regular); the
+            # Diversified label is accepted for backwards compatibility with
+            # any older archived snapshot files.
+            key = "INDEX:EMBI"
         else:
             key = normalize_name(instrument)
         out[key] = row
@@ -525,6 +529,69 @@ def merge_snapshots(file_results: List[Tuple[Optional[datetime], Dict[str, Dict[
         return None, {}, []
     latest_date, latest_data = sorted_snaps[-1]
     return latest_date, latest_data, sorted_snaps
+
+
+def snapshot_to_returns(
+    snap_date: datetime,
+    snap_data: Dict[str, Dict[str, Any]],
+) -> Tuple[List[datetime], Dict[Tuple[str, str], List[Optional[float]]]]:
+    """Convert one snapshot into a synthetic (dates, series) tuple matching the
+    shape of a returns file. This lets a snapshot be merged into the same time
+    series that drives the Spreads/Yields/TR_YTD tabs.
+
+    Mapping:
+      Snapshot 'EMBI Global' (or 'EMBI Global Diversified')  → 'EMBI Global'
+      Snapshot region rollups                                → corresponding *_Region names
+      Snapshot countries                                     → same name (already normalized)
+
+      Snapshot 'Index Level'        → 'Cum Tot Ret Idx'
+      Snapshot 'Yield to Worst'     → 'Yld to Maturity'
+      Snapshot 'Z Spread to Worst'  → 'Z Spread'
+
+    For non-callable bullet bonds (the bulk of the EMBI Global universe),
+    Yield-to-Worst equals Yield-to-Maturity and Z-Spread-to-Worst equals
+    Z-Spread exactly. So the metric mapping is clean. On any date where the
+    real returns file ALSO has data, the real returns wins (this function
+    feeds in BEFORE the real returns).
+
+    Both EMBI Global and EMBI Global Diversified snapshots are accepted for
+    backwards compatibility — but in normal use the user downloads the
+    regular EMBI Global, which matches the rest of the workbook directly.
+    """
+    series: Dict[Tuple[str, str], List[Optional[float]]] = {}
+    for ent, data in snap_data.items():
+        if ent in _SNAPSHOT_ENTITY_TO_RETURNS:
+            returns_ent = _SNAPSHOT_ENTITY_TO_RETURNS[ent]
+        elif isinstance(ent, str) and not ent.startswith(("REGION:", "INDEX:", "AGG:")):
+            returns_ent = ent
+        else:
+            continue
+        for field, metric in _SNAPSHOT_FIELD_TO_METRIC.items():
+            raw = (data.get(field) or "").strip() if data else ""
+            if not raw:
+                continue
+            try:
+                v = float(raw)
+            except ValueError:
+                continue
+            series[(returns_ent, metric)] = [v]
+    return [snap_date], series
+
+
+_SNAPSHOT_ENTITY_TO_RETURNS: Dict[str, str] = {
+    "INDEX:EMBI":    "EMBI Global",
+    "REGION:Africa": "Africa Region",
+    "REGION:Asia":   "Asia Region",
+    "REGION:Europe": "Europe Region",
+    "REGION:LatAm":  "Latin Region",
+    "REGION:GCC":    "Mideast Region",
+}
+
+_SNAPSHOT_FIELD_TO_METRIC: Dict[str, str] = {
+    "Index Level":       "Cum Tot Ret Idx",
+    "Yield to Worst":    "Yld to Maturity",
+    "Z Spread to Worst": "Z Spread",
+}
 
 
 def archive_snapshots(input_paths: List[Path], project_dir: Path) -> Tuple[Path, List[Tuple[str, str]]]:
@@ -882,6 +949,17 @@ class Builder:
              "date, both for the Weights tab (latest values) and the Weights_History tab (full "
              "trajectory). You don't need to download a new weights-history file every month — "
              "snapshots alone keep your weight data current."),
+            ("Snapshot spreads/yields/TR also feed the time series",
+             "Each snapshot also contains spread, yield, and index-level data per country and per "
+             "region rollup. The script converts these into synthetic rows that get appended to "
+             "the Spreads / Yields / TR_YTD tabs as a new column at the snapshot date. Mapping: "
+             "Yield-to-Worst → YTM; Z-Spread-to-Worst → Z-Spread; Index Level → Cum Tot Ret Idx. "
+             "For non-callable bullet bonds (the bulk of the EMBI Global universe) YTW = YTM "
+             "exactly. On any date where the JPM returns file ALSO has data, the returns file "
+             "wins. So as you drop fresh EMBI Global snapshots in monthly, you get a fresh column "
+             "in every time-series tab — even without re-downloading the returns file. "
+             "(EMBI Global Diversified snapshots are also supported for backwards compatibility, "
+             "but the regular EMBI Global is what matches the rest of the workbook.)"),
             ("",""),
             ("Required files (download from JPM)",
              "Three file types power this workbook. You don't need all three every time, but you do "
@@ -1734,7 +1812,7 @@ class Builder:
 
         # Spread duration — pull from snapshot if available, otherwise a
         # reasonable EMBI Global default.
-        snap_idx = self.snap_data.get("INDEX:EMBIGD") or {}
+        snap_idx = self.snap_data.get("INDEX:EMBI") or {}
         try:
             duration = float(snap_idx.get("Spread Duration") or "")
         except (TypeError, ValueError):
@@ -2875,13 +2953,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     if skipped:
         print(f"  Skipped {len(skipped)} non-JPM CSVs: {', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}")
 
-    if not returns_results:
-        print("ERROR: at least one RETURNS file is required", file=sys.stderr)
-        return 1
-
-    dates, series = merge_returns(returns_results)
-    weight_dates, weight_series = merge_weights_history(weights_results)
     snap_date, snap_data, snap_history = merge_snapshots(snapshot_results)
+
+    # Generate synthetic returns rows from accumulated snapshots and prepend
+    # to returns_results — synthetic processed first, real returns last, so on
+    # any overlapping date the real returns file wins. This is what makes the
+    # Spreads / Yields / TR_YTD tabs grow a new column every time the user
+    # drops a fresh snapshot in the folder.
+    synthetic_returns: List[Tuple[List[datetime], Dict[Tuple[str, str], List[Optional[float]]]]] = []
+    for s_date, s_data in snap_history:
+        syn_dates, syn_series = snapshot_to_returns(s_date, s_data)
+        if syn_series:
+            synthetic_returns.append((syn_dates, syn_series))
+    if synthetic_returns:
+        print(f"  Synthesized {len(synthetic_returns)} returns row(s) from accumulated snapshots")
+
+    if not returns_results and not synthetic_returns:
+        print("ERROR: no time-series data found (need either a returns file "
+              "or at least one snapshot)", file=sys.stderr)
+        return 1
+    if not returns_results:
+        print("\n  WARNING: no JPM returns file found — time-series tabs will only "
+              "contain dates from the snapshots you've accumulated. Add a "
+              "Query 3 returns CSV to the folder for full historical context.",
+              file=sys.stderr)
+
+    dates, series = merge_returns(synthetic_returns + returns_results)
+    weight_dates, weight_series = merge_weights_history(weights_results)
 
     print(f"\n  Returns:   {len(dates)} dates × {len(series)} series")
     print(f"  Weights:   {len(weight_dates)} dates × {len(weight_series)} countries")
