@@ -7,8 +7,10 @@ CSVs and produces a single structured Excel workbook. The script auto-
 detects three JPM file types and merges them:
 
   1. RETURNS file        — wide CSV, columns "EM Debt Indices | <Entity> | <Metric>"
-                           Metrics: Cum Tot Ret Idx, Yld to Maturity, Z Spread,
-                           Index Weight (%) (often empty / legacy EMBI only).
+                           Metrics: Cum Tot Ret Idx, Yld to Maturity, STW (Trsy)
+                           (the spread-to-worst over Treasury curve — pulled in
+                           place of the legacy Z-Spread tag). Index Weight (%)
+                           is also accepted but is often empty / legacy-EMBI only.
                            One row per date.
 
   2. WEIGHTS HISTORY     — two-row header. Row 1: FC_EMBIG_* codes.
@@ -18,7 +20,8 @@ detects three JPM file types and merges them:
 
   3. SNAPSHOT            — flat CSV, one row per entity. Header includes
                            "Bam Id", "Instrument", "Mkt Cap %", "Average S&P
-                           Rating", "Yield to Worst", "Z Spread to Worst",
+                           Rating", "Yield to Worst", "STW (Trsy)" (and the
+                           older "Z Spread to Worst" column, which we ignore),
                            "Spread Duration", and various return metrics
                            (Daily / MTD / YTD). Single trade date.
 
@@ -195,9 +198,24 @@ LATAM_FOCUS: List[str] = [
 
 INDEX_NAME = "EMBI Global"
 METRICS = {
-    "spread": "Z Spread",
+    "spread": "STW (Trsy)",   # spread-to-worst over the Treasury curve (Alberto's
+                              # preferred spread tag — replaces the legacy "Z Spread"
+                              # that was used in earlier builds of this script)
     "yield":  "Yld to Maturity",
     "tret":   "Cum Tot Ret Idx",
+}
+
+# Accepted spellings for the spread metric, normalized to METRICS["spread"].
+# The returns-file column header pattern is "EM Debt Indices | <Entity> | <Metric>",
+# but JPM (and the user's own renames) ship the spread metric under any of these
+# spellings depending on which DataQuery template the file came from.
+SPREAD_METRIC_ALIASES: Dict[str, str] = {
+    "stw (trsy)":          "STW (Trsy)",
+    "stw(trsy)":           "STW (Trsy)",
+    "stw trsy":            "STW (Trsy)",
+    "stw":                 "STW (Trsy)",
+    "spread to worst":     "STW (Trsy)",
+    "spread to worst (trsy)": "STW (Trsy)",
 }
 
 # Maps spellings used by snapshot / weights / returns files to a single canonical form.
@@ -371,7 +389,13 @@ def load_returns(path: Path) -> Tuple[List[datetime], Dict[Tuple[str, str], List
         if len(parts) < 3:
             columns.append(("", ""))
             continue
-        columns.append((normalize_name(parts[1]), parts[2]))
+        metric = parts[2]
+        # Normalize any STW (Trsy) spelling variant to the canonical form
+        # so downstream code only ever has to look up METRICS["spread"].
+        metric_key = metric.strip().lower()
+        if metric_key in SPREAD_METRIC_ALIASES:
+            metric = SPREAD_METRIC_ALIASES[metric_key]
+        columns.append((normalize_name(parts[1]), metric))
 
     parsed: List[Tuple[datetime, List[Optional[float]]]] = []
     for row in rows:
@@ -544,15 +568,15 @@ def snapshot_to_returns(
       Snapshot region rollups                                → corresponding *_Region names
       Snapshot countries                                     → same name (already normalized)
 
-      Snapshot 'Index Level'        → 'Cum Tot Ret Idx'
-      Snapshot 'Yield to Worst'     → 'Yld to Maturity'
-      Snapshot 'Z Spread to Worst'  → 'Z Spread'
+      Snapshot 'Index Level'    → 'Cum Tot Ret Idx'
+      Snapshot 'Yield to Worst' → 'Yld to Maturity'
+      Snapshot 'STW (Trsy)'     → 'STW (Trsy)'      # spread-to-worst over Treasury
 
     For non-callable bullet bonds (the bulk of the EMBI Global universe),
-    Yield-to-Worst equals Yield-to-Maturity and Z-Spread-to-Worst equals
-    Z-Spread exactly. So the metric mapping is clean. On any date where the
-    real returns file ALSO has data, the real returns wins (this function
-    feeds in BEFORE the real returns).
+    Yield-to-Worst equals Yield-to-Maturity, and the snapshot's STW (Trsy)
+    is the canonical EM credit spread we track. On any date where the real
+    returns file ALSO has data, the real returns wins (this function feeds
+    in BEFORE the real returns).
 
     Both EMBI Global and EMBI Global Diversified snapshots are accepted for
     backwards compatibility — but in normal use the user downloads the
@@ -590,7 +614,10 @@ _SNAPSHOT_ENTITY_TO_RETURNS: Dict[str, str] = {
 _SNAPSHOT_FIELD_TO_METRIC: Dict[str, str] = {
     "Index Level":       "Cum Tot Ret Idx",
     "Yield to Worst":    "Yld to Maturity",
-    "Z Spread to Worst": "Z Spread",
+    # The snapshot CSV always carries an "STW (Trsy)" column AND a
+    # "Z Spread to Worst" column. We feed the time series exclusively from
+    # STW (Trsy) — that's the spread Alberto trades off.
+    "STW (Trsy)":        "STW (Trsy)",
 }
 
 
@@ -953,7 +980,7 @@ class Builder:
              "Each snapshot also contains spread, yield, and index-level data per country and per "
              "region rollup. The script converts these into synthetic rows that get appended to "
              "the Spreads / Yields / TR_YTD tabs as a new column at the snapshot date. Mapping: "
-             "Yield-to-Worst → YTM; Z-Spread-to-Worst → Z-Spread; Index Level → Cum Tot Ret Idx. "
+             "Yield-to-Worst → YTM; STW (Trsy) → STW (Trsy); Index Level → Cum Tot Ret Idx. "
              "For non-callable bullet bonds (the bulk of the EMBI Global universe) YTW = YTM "
              "exactly. On any date where the JPM returns file ALSO has data, the returns file "
              "wins. So as you drop fresh EMBI Global snapshots in monthly, you get a fresh column "
@@ -970,7 +997,9 @@ class Builder:
              "and case differences."),
             ("  1. RETURNS file",
              "JPM 'Markets / DataQuery' EMBI Global query. Columns named 'EM Debt Indices | <Entity> | "
-             "<Metric>'. Metrics: Cum Tot Ret Idx, Yld to Maturity, Z Spread. One row per date. "
+             "<Metric>'. Metrics: Cum Tot Ret Idx, Yld to Maturity, STW (Trsy). One row per date. "
+             "If you're re-using an older DataQuery template, the spread metric may come down as "
+             "'Z Spread' instead — the script does NOT use that column; pull STW (Trsy) explicitly. "
              "Typical filename: 'Query 3_<id>.csv'. Download whatever frequency you want — monthly to "
              "build history, then daily going forward. Both work."),
             ("  2. WEIGHTS HISTORY file",
@@ -1469,8 +1498,7 @@ class Builder:
             ("Moody's", 9, "Average Moody Rating"),
             ("Fitch", 8, "Average Fitch Rating"),
             ("YTW", 10, "Yield to Worst"),
-            ("STW (Trsy)", 11, "STW (Trsy)"),
-            ("Z-Spread to Worst", 16, "Z Spread to Worst"),
+            ("STW (Trsy)", 12, "STW (Trsy)"),
             ("Spread Dur", 11, "Spread Duration"),
             ("Avg Life", 10, "Avr. Life"),
             ("MTD chg %", 11, "MTD Change (%)"),
@@ -1525,10 +1553,11 @@ class Builder:
                     cell.number_format = "0.00"
                 elif "Change" in key:
                     cell.number_format = "+0.00;-0.00;0.00"
-                elif key in ("Yield to Worst", "STW (Trsy)", "Spread Duration", "Avr. Life"):
-                    cell.number_format = "0.00"
-                elif key == "Z Spread to Worst":
+                elif key == "STW (Trsy)":
+                    # Spread to worst is quoted in bps in JPM's snapshot dump
                     cell.number_format = "0"
+                elif key in ("Yield to Worst", "Spread Duration", "Avr. Life"):
+                    cell.number_format = "0.00"
                 elif key in ("No. of Issues", "No. of Issuer"):
                     cell.number_format = "0"
                 else:
@@ -1747,7 +1776,7 @@ class Builder:
                     cell.number_format = fmt
             return start_row + 1, start_row + 1 + len(chart_dates), start_row + 2 + len(chart_dates)
 
-        spr_h, spr_l, nxt = _block(chart_block + 2, "Z-Spread (bps)", METRICS["spread"], "0", False)
+        spr_h, spr_l, nxt = _block(chart_block + 2, "STW (Trsy) — bps", METRICS["spread"], "0", False)
         yld_h, yld_l, nxt = _block(nxt + 3, "Yield to Maturity (%)", METRICS["yield"], "0.00", False)
         tr_h, tr_l, _ = _block(nxt + 3, "Cumulative Total Return — rebased to 100", METRICS["tret"], "0.00", True)
 
@@ -1764,7 +1793,7 @@ class Builder:
             ch.set_categories(cats)
             return ch
 
-        ws.add_chart(_line("Z-Spread — focus vs LatAm vs EMBI Global", "bps", spr_h, spr_l), f"J{header_row}")
+        ws.add_chart(_line("STW (Trsy) — focus vs LatAm vs EMBI Global", "bps", spr_h, spr_l), f"J{header_row}")
         ws.add_chart(_line("Yield to Maturity — focus vs benchmarks", "%", yld_h, yld_l), f"J{header_row + 22}")
         ws.add_chart(_line("Cumulative Total Return (rebased = 100)", "Index", tr_h, tr_l), f"J{header_row + 44}")
 
@@ -1941,7 +1970,7 @@ class Builder:
         ws.cell(row=12, column=3).alignment = Alignment(horizontal="right")
         ws.cell(row=12, column=3).border = THIN_BORDER
 
-        cur_spread_cell = _const_cell(13, "EMBI Global Z-Spread (bps)", cur_spread, fmt="0")
+        cur_spread_cell = _const_cell(13, "EMBI Global STW (Trsy) — bps", cur_spread, fmt="0")
         cur_yield_cell  = _const_cell(14, "EMBI Global Yield to Maturity (%)", cur_yield / 100, fmt="0.00%")
         # Implied UST = yield - spread/10000 (since spread in bps and yield in %)
         ws.cell(row=15, column=2, value="Implied UST 10Y (%)")
@@ -2177,7 +2206,7 @@ class Builder:
 
         # Build the line chart (5 lines for the percentile bands)
         fan = LineChart()
-        fan.title = "EMBI Global Z-Spread fan — projected (bps)"
+        fan.title = "EMBI Global STW (Trsy) fan — projected (bps)"
         fan.style = 12
         fan.y_axis.title = "bps"
         fan.x_axis.title = "Months ahead"
@@ -2224,7 +2253,7 @@ class Builder:
              "Returns assumed normal. Real spread distributions are fatter-tailed; treat the 5/95 bands "
              "as approximate. For a true tail-risk view, set Volatility multiplier to 1.5–2.0."),
             ("Calibration",
-             "Mean and σ are estimated from the EMBI Global Z-Spread monthly time series in the loaded "
+             "Mean and σ are estimated from the EMBI Global STW (Trsy) monthly time series in the loaded "
              "returns file. As you re-run the script with more data, the calibration sample grows and "
              "the model becomes more reliable."),
             ("Sensitivity coefficients",
@@ -2570,7 +2599,7 @@ class Builder:
               "Normal. Spread changes are decomposed into a deterministic DRIFT (responding "
               "linearly to four macro drivers: UST 10Y, DXY, VIX, EM rating drift) and a "
               "stochastic SHOCK (drawn from a Normal distribution with vol calibrated on "
-              "the EMBI Global Z-spread monthly time series). Yield and total return drop "
+              "the EMBI Global STW (Trsy) monthly time series). Yield and total return drop "
               "out by accounting identity (yield = UST + spread; TR ≈ carry − duration·ΔY)."); r += 1
         _spacer(r); r += 1
 
@@ -2578,7 +2607,7 @@ class Builder:
         _h2(r, "2.  What is estimated from your data vs what is set as a prior"); r += 1
         _h3(r, "Estimated from your loaded data — auto-updates every time you re-run the script:"); r += 1
         for txt in [
-            "•  Historical mean drift (μ) — sample mean of monthly EMBI Global Z-spread changes",
+            "•  Historical mean drift (μ) — sample mean of monthly EMBI Global STW (Trsy) changes",
             "•  Historical volatility (σ) — sample standard deviation of those changes",
             "•  Current spread, current yield, implied UST — pulled from the latest data point",
             "•  Spread duration — pulled from the latest snapshot file",
@@ -2761,7 +2790,7 @@ class Builder:
                         ws.cell(row=start_row + 2 + i, column=2 + j, value=v).number_format = fmt
             return start_row + 1, start_row + 1 + len(chart_dates)
 
-        spr_h, spr_l = _fill_block(60, "Z-Spread by region — time series", METRICS["spread"], "0")
+        spr_h, spr_l = _fill_block(60, "STW (Trsy) by region — time series", METRICS["spread"], "0")
         nxt = spr_l + 5
         yld_h, yld_l = _fill_block(nxt, "Yield by region — time series", METRICS["yield"], "0.00")
         nxt2 = yld_l + 5
@@ -2804,7 +2833,7 @@ class Builder:
             ch.set_categories(cats)
             return ch
 
-        ws.add_chart(_make("Z-Spread by Region (bps)", "bps", spr_h, spr_l, len(REGION_ORDER)), "B3")
+        ws.add_chart(_make("STW (Trsy) by Region (bps)", "bps", spr_h, spr_l, len(REGION_ORDER)), "B3")
         ws.add_chart(_make("Yield to Maturity by Region (%)", "%", yld_h, yld_l, len(REGION_ORDER)), "B25")
         ws.add_chart(_make("Cumulative Total Return (rebased = 100)", "Index", tr_h, tr_l, len(cols_to_plot)), "B47")
 
