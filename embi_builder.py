@@ -1481,39 +1481,79 @@ class Builder:
             c.alignment = Alignment(horizontal="right")
             c.border = THIN_BORDER
 
-    # --------- Contribution decomposition ----------
+    # --------- Contribution decomposition (regional) ----------
     def build_contribution(self):
-        """Per-country contribution to index Spread / Yield / TR, computed at
-        the latest snapshot and as country-by-country averages over rolling
-        1y, 3y, and 5y windows. Lets the user chart "who's driving the index"
-        today vs. historically. No charts on this tab — Alberto builds them
-        in Excel and they survive script re-runs because the column layout
-        is stable."""
+        """Regional contribution to index Spread / Yield / TR using JPM's
+        duration-times-spread (DTS) weighting convention so the bottom-row
+        sum reconciles to the headline EMBI Global STW / YTW.
+
+        Spread / Yield contributions use DTS effective weight:
+            eff_w_r = (W_r × Dur_r) / Σ_k (W_k × Dur_k)
+            contrib = eff_w_r × spread_r   (or × yield_r)
+        TR contribution stays cap-weighted (correct for return).
+
+        Spread duration is taken from the latest snapshot's regional rollup;
+        the same duration is used as a proxy for 1y/3y/5y windows because we
+        don't carry a duration time series. Falls back gracefully to cap-
+        weighting if no snapshot is loaded.
+
+        No charts on this tab — column layout is stable across script reruns
+        so Alberto's manually-built charts survive regeneration."""
         ws = self.wb.create_sheet("Contribution")
         ws.sheet_view.showGridLines = False
-        ws["A1"] = "Contribution decomposition — Weight × Metric"
+        ws["A1"] = "Regional contribution to EMBI Global (DTS-weighted)"
         self._font(ws["A1"], size=14, bold=True, color=COLOR_HEADER_BG)
         ws.row_dimensions[1].height = 22
 
-        ws["A2"] = (
-            "Each country's contribution = (country weight %) × (country metric). "
-            "Sum of contributions ≈ headline index value; small tracking error vs. "
-            "the duration-weighted JPM index is expected. Spread/Yield window "
-            "averages are arithmetic means; TR window is annualized geometric return."
-        )
-        ws.merge_cells("A2:R2")
+        # Pull regional spread durations from snapshot (None if absent).
+        regional_durations: Dict[str, Optional[float]] = {}
+        for region in REGION_ORDER:
+            snap_r = self.snap_data.get(f"REGION:{region}") or {}
+            d = snap_r.get("Spread Duration")
+            try:
+                regional_durations[region] = float(d) if d not in (None, "", "N/A") else None
+            except (TypeError, ValueError):
+                regional_durations[region] = None
+        # Index-level duration for sanity / tracking-error context
+        snap_idx = self.snap_data.get("INDEX:EMBI") or {}
+        try:
+            index_duration = float(snap_idx.get("Spread Duration") or "") or None
+        except (TypeError, ValueError):
+            index_duration = None
+        has_durations = any(v is not None for v in regional_durations.values())
+
+        if has_durations:
+            method_note = (
+                "Spread/Yield contributions use DTS weighting: eff_weight = (Weight × Duration) / "
+                "Σ(Weight × Duration). Sum of regional contributions should reconcile to the JPM "
+                "index headline within tracking error. TR contribution stays cap-weighted "
+                "(weight × return). Historical windows use the LATEST snapshot's regional duration "
+                "as a proxy — fair for 1–5y horizons but not for major restructurings."
+            )
+        else:
+            method_note = (
+                "No snapshot loaded, so no spread duration available — falling back to "
+                "cap-weighting (Weight × Spread). This systematically overstates the index "
+                "spread vs. JPM's DTS-weighted headline because distressed short-duration "
+                "names get the same weight as long-duration core. Load a snapshot to fix."
+            )
+        ws["A2"] = method_note
+        ws.merge_cells("A2:AD2")
         self._font(ws["A2"], color=COLOR_NOTE, italic=True)
         ws["A2"].alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[2].height = 44
+        ws.row_dimensions[2].height = 58
 
-        if self.weight_dates and self.dates:
-            ws["A3"] = (
-                f"Latest weights date: {self.weight_dates[-1]:%Y-%m-%d} · "
-                f"Latest returns date: {self.dates[-1]:%Y-%m-%d}"
-            )
+        date_bits = []
+        if self.weight_dates:
+            date_bits.append(f"Latest weights: {self.weight_dates[-1]:%Y-%m-%d}")
+        if self.dates:
+            date_bits.append(f"Latest returns: {self.dates[-1]:%Y-%m-%d}")
+        if self.snap_date:
+            date_bits.append(f"Snapshot (for duration): {self.snap_date:%Y-%m-%d}")
+        if date_bits:
+            ws["A3"] = " · ".join(date_bits)
             self._font(ws["A3"], color=COLOR_NOTE, italic=True)
 
-        # Period blocks
         periods: List[Tuple[str, int]] = [
             ("Current", 0),
             ("1y avg",  12),
@@ -1521,23 +1561,19 @@ class Builder:
             ("5y avg",  60),
         ]
 
-        grp_row = 5
-        hdr_row = 6
+        grp_row, hdr_row = 5, 6
         first_data_row = hdr_row + 1
-
-        col_headers = ["Weight %", "Spread (bps)", "Yield %", "TR %",
+        col_headers = ["Weight %", "Duration", "Spread (bps)", "Yield %", "TR %",
                        "Contrib Spread", "Contrib Yield", "Contrib TR"]
 
-        # Region + Country labels (span both header rows)
+        # Region label column header — spans both header rows
         self._hdr(ws.cell(row=grp_row, column=1), "Region")
-        self._hdr(ws.cell(row=grp_row, column=2), "Country")
-        ws.merge_cells(start_row=grp_row, start_column=1, end_row=hdr_row, end_column=1)
-        ws.merge_cells(start_row=grp_row, start_column=2, end_row=hdr_row, end_column=2)
-        ws.column_dimensions["A"].width = 12
-        ws.column_dimensions["B"].width = 22
+        ws.merge_cells(start_row=grp_row, start_column=1,
+                       end_row=hdr_row, end_column=1)
+        ws.column_dimensions["A"].width = 22
 
         period_col_starts: Dict[str, int] = {}
-        col = 3
+        col = 2
         for label, _ in periods:
             period_col_starts[label] = col
             grp_cell = ws.cell(row=grp_row, column=col, value=label)
@@ -1549,7 +1585,7 @@ class Builder:
                            end_row=grp_row, end_column=col + len(col_headers) - 1)
             for j, h in enumerate(col_headers):
                 self._hdr(ws.cell(row=hdr_row, column=col + j), h)
-                ws.column_dimensions[get_column_letter(col + j)].width = 13
+                ws.column_dimensions[get_column_letter(col + j)].width = 14
             col += len(col_headers)
 
         ytd_idx = self.year_start_index(datetime.now().year)
@@ -1557,92 +1593,137 @@ class Builder:
         yield_metric  = METRICS["yield"]
         tret_metric   = METRICS["tret"]
 
-        row = first_data_row
-        for region in REGION_ORDER:
+        # ---- helpers scoped to this builder ----------------------------------
+
+        def regional_weight_current(region: str) -> Optional[float]:
             countries = self.countries_by_region.get(region, [])
-            if not countries:
-                continue
-            # Region banner row (single cell across; data cells stay blank
-            # so SUM at the bottom isn't polluted).
-            self._region_lbl(ws.cell(row=row, column=1), region)
-            for c in range(2, col):
-                cell = ws.cell(row=row, column=c, value="")
-                cell.fill = PatternFill("solid", start_color=COLOR_REGION_BG)
-                cell.border = THIN_BORDER
+            vals = [self.latest_weight(c) for c in countries]
+            vals = [v for v in vals if v is not None]
+            return sum(vals) if vals else None
+
+        def regional_weight_window(region: str, months: int) -> Optional[float]:
+            countries = self.countries_by_region.get(region, [])
+            total = 0.0
+            saw = False
+            for c in countries:
+                avg = self._avg_in_window(self.weight_dates,
+                                          self.weight_series.get(c) or [], months)
+                if avg is not None:
+                    total += avg
+                    saw = True
+            return total if saw else None
+
+        def region_tr_ytd(agg_entity: str) -> Optional[float]:
+            tr_end   = self.latest_value(agg_entity, tret_metric)
+            tr_start = (self.value_at(agg_entity, tret_metric, ytd_idx)
+                        if ytd_idx is not None else None)
+            if tr_end is not None and tr_start not in (None, 0):
+                return (tr_end / tr_start) - 1.0
+            return None
+
+        regions_with_data = [r for r in REGION_ORDER if self.countries_by_region.get(r)]
+
+        # ---- PASS 1: collect (W, Dur, Sp, Yd, Tr) for each (region, period) -
+        # We need the full set per period to compute Σ(W × Dur) and thus the
+        # DTS-weighted contributions.
+        data: Dict[Tuple[str, str], Dict[str, Optional[float]]] = {}
+        for region in regions_with_data:
+            agg = REGION_AGGREGATE[region]
+            dur = regional_durations.get(region)   # latest snapshot proxy, same for all periods
+            for label, months in periods:
+                if months == 0:
+                    w  = regional_weight_current(region)
+                    sp = self.latest_value(agg, spread_metric)
+                    yd = self.latest_value(agg, yield_metric)
+                    tr = region_tr_ytd(agg)
+                else:
+                    w  = regional_weight_window(region, months)
+                    sp = self._avg_in_window(
+                        self.dates, self.series.get((agg, spread_metric)) or [], months)
+                    yd = self._avg_in_window(
+                        self.dates, self.series.get((agg, yield_metric)) or [], months)
+                    tr = self._annualized_return_in_window(agg, months)
+                data[(region, label)] = {"w": w, "dur": dur, "sp": sp, "yd": yd, "tr": tr}
+
+        # Per-period Σ(W × Dur) for normalisation. If no durations are
+        # available, we fall back to plain Σ(W) which makes the math identical
+        # to old cap-weighting (and contribs revert to W × Sp / 100).
+        period_dts_total: Dict[str, Optional[float]] = {}
+        for label, _ in periods:
+            if has_durations:
+                total = 0.0
+                seen = False
+                for region in regions_with_data:
+                    rec = data[(region, label)]
+                    w, d = rec["w"], rec["dur"]
+                    if w is not None and d is not None:
+                        total += w * d
+                        seen = True
+                period_dts_total[label] = total if seen else None
+            else:
+                period_dts_total[label] = None
+
+        # ---- PASS 2: write rows ---------------------------------------------
+        row = first_data_row
+        for region in regions_with_data:
+            self._region_lbl(ws.cell(row=row, column=1), f"EMBI {region}")
+            for label, months in periods:
+                col0 = period_col_starts[label]
+                rec = data[(region, label)]
+                w, dur, sp, yd, tr = rec["w"], rec["dur"], rec["sp"], rec["yd"], rec["tr"]
+                dts_tot = period_dts_total[label]
+
+                self._val(ws.cell(row=row, column=col0 + 0),
+                          w  if w  is not None else "", fmt="0.00", color=COLOR_HARDCODE)
+                self._val(ws.cell(row=row, column=col0 + 1),
+                          dur if dur is not None else "", fmt="0.00", color=COLOR_HARDCODE)
+                self._val(ws.cell(row=row, column=col0 + 2),
+                          sp if sp is not None else "", fmt="0",    color=COLOR_HARDCODE)
+                self._val(ws.cell(row=row, column=col0 + 3),
+                          yd if yd is not None else "", fmt="0.00", color=COLOR_HARDCODE)
+                self._val(ws.cell(row=row, column=col0 + 4),
+                          tr if tr is not None else "", fmt="0.00%;(0.00%);-",
+                          color=COLOR_HARDCODE)
+
+                # Spread / Yield: DTS-weighted if duration available, else cap-weighted.
+                if dts_tot and w is not None and dur is not None and sp is not None:
+                    contrib_sp = (w * dur / dts_tot) * sp
+                elif w is not None and sp is not None:
+                    contrib_sp = w * sp / 100.0
+                else:
+                    contrib_sp = None
+                if dts_tot and w is not None and dur is not None and yd is not None:
+                    contrib_yd = (w * dur / dts_tot) * yd
+                elif w is not None and yd is not None:
+                    contrib_yd = w * yd / 100.0
+                else:
+                    contrib_yd = None
+                # TR contribution stays cap-weighted (return is naturally cap-weighted)
+                contrib_tr = (w * tr / 100.0) if (w is not None and tr is not None) else None
+
+                self._val(ws.cell(row=row, column=col0 + 5),
+                          contrib_sp if contrib_sp is not None else "", fmt="0.0")
+                self._val(ws.cell(row=row, column=col0 + 6),
+                          contrib_yd if contrib_yd is not None else "", fmt="0.000")
+                self._val(ws.cell(row=row, column=col0 + 7),
+                          contrib_tr if contrib_tr is not None else "",
+                          fmt="0.00%;(0.00%);-")
             row += 1
 
-            for country in countries:
-                ws.cell(row=row, column=1, value="").border = THIN_BORDER
-                name_cell = ws.cell(row=row, column=2, value=country)
-                name_cell.border = THIN_BORDER
-                self._font(name_cell)
-                name_cell.alignment = Alignment(horizontal="left", vertical="center")
-
-                for label, months in periods:
-                    col0 = period_col_starts[label]
-
-                    if months == 0:
-                        w  = self.latest_weight(country)
-                        sp = self.latest_value(country, spread_metric)
-                        yd = self.latest_value(country, yield_metric)
-                        tr_end   = self.latest_value(country, tret_metric)
-                        tr_start = (self.value_at(country, tret_metric, ytd_idx)
-                                    if ytd_idx is not None else None)
-                        if tr_end is not None and tr_start not in (None, 0):
-                            tr = (tr_end / tr_start) - 1.0   # YTD as decimal
-                        else:
-                            tr = None
-                    else:
-                        w  = self._avg_in_window(self.weight_dates,
-                                                 self.weight_series.get(country) or [],
-                                                 months)
-                        sp = self._avg_in_window(self.dates,
-                                                 self.series.get((country, spread_metric)) or [],
-                                                 months)
-                        yd = self._avg_in_window(self.dates,
-                                                 self.series.get((country, yield_metric)) or [],
-                                                 months)
-                        tr = self._annualized_return_in_window(country, months)
-
-                    # Raw values
-                    self._val(ws.cell(row=row, column=col0 + 0),
-                              w  if w  is not None else "", fmt="0.00", color=COLOR_HARDCODE)
-                    self._val(ws.cell(row=row, column=col0 + 1),
-                              sp if sp is not None else "", fmt="0",    color=COLOR_HARDCODE)
-                    self._val(ws.cell(row=row, column=col0 + 2),
-                              yd if yd is not None else "", fmt="0.00", color=COLOR_HARDCODE)
-                    self._val(ws.cell(row=row, column=col0 + 3),
-                              tr if tr is not None else "", fmt="0.00%;(0.00%);-",
-                              color=COLOR_HARDCODE)
-
-                    # Contributions: weight is percent (e.g. 5.0 = 5%),
-                    # spread is bps, yield is %, tr is decimal.
-                    # Contrib Spread (bps)  = w/100 * sp
-                    # Contrib Yield (%)     = w/100 * yd
-                    # Contrib TR (decimal)  = w/100 * tr   (displayed as %)
-                    self._val(ws.cell(row=row, column=col0 + 4),
-                              (w * sp / 100.0) if (w is not None and sp is not None) else "",
-                              fmt="0.0")
-                    self._val(ws.cell(row=row, column=col0 + 5),
-                              (w * yd / 100.0) if (w is not None and yd is not None) else "",
-                              fmt="0.000")
-                    self._val(ws.cell(row=row, column=col0 + 6),
-                              (w * tr / 100.0) if (w is not None and tr is not None) else "",
-                              fmt="0.00%;(0.00%);-")
-                row += 1
-
-        # Total row: SUM each numeric column (region banner rows are blank, so
-        # they don't disturb the SUM).
+        # ---- INDEX TOTAL row -------------------------------------------------
+        # SUM the weight column and the three contribution columns. The raw
+        # spread / yield / TR cells get the JPM index headline pulled directly
+        # from the EMBI Global series so Alberto can eyeball reconciliation:
+        # SUM(contrib spread) should land near the headline spread cell.
         last_data_row = row - 1
-        self._index_lbl(ws.cell(row=row, column=1), "INDEX")
-        self._index_lbl(ws.cell(row=row, column=2), "TOTAL (sum)")
+        self._index_lbl(ws.cell(row=row, column=1), "EMBI Global (headline)")
         for label, _ in periods:
             col0 = period_col_starts[label]
             sum_cols = {
-                col0 + 0: "0.00",                  # weight sums to ~100
-                col0 + 4: "0.0",                   # spread contribution in bps
-                col0 + 5: "0.000",                 # yield contribution in %
-                col0 + 6: "0.00%;(0.00%);-",       # TR contribution as %
+                col0 + 0: "0.00",                # weight (~100)
+                col0 + 5: "0.0",                 # contrib spread, bps
+                col0 + 6: "0.000",               # contrib yield, %
+                col0 + 7: "0.00%;(0.00%);-",     # contrib TR, %
             }
             for c_idx, fmt in sum_cols.items():
                 letter = get_column_letter(c_idx)
@@ -1653,13 +1734,36 @@ class Builder:
                 self._font(cell, bold=True)
                 cell.alignment = Alignment(horizontal="right", vertical="center")
                 cell.border = THIN_BORDER
-            # Blank pad cells so the row reads cleanly
-            for offset in (1, 2, 3):
-                pad = ws.cell(row=row, column=col0 + offset, value="")
-                pad.fill = PatternFill("solid", start_color=COLOR_INDEX_BG)
-                pad.border = THIN_BORDER
+            # Headline values from the JPM index series for spread / yield / TR,
+            # plus the index-level spread duration from the snapshot.
+            for offset, fmt, fetch in (
+                (1, "0.00",
+                    lambda lbl=label: index_duration if lbl == "Current" else index_duration),
+                (2, "0",
+                    lambda lbl=label: self.latest_value(INDEX_NAME, spread_metric)
+                    if lbl == "Current"
+                    else self._avg_in_window(self.dates,
+                         self.series.get((INDEX_NAME, spread_metric)) or [],
+                         dict(periods)[lbl])),
+                (3, "0.00",
+                    lambda lbl=label: self.latest_value(INDEX_NAME, yield_metric)
+                    if lbl == "Current"
+                    else self._avg_in_window(self.dates,
+                         self.series.get((INDEX_NAME, yield_metric)) or [],
+                         dict(periods)[lbl])),
+                (4, "0.00%;(0.00%);-",
+                    lambda lbl=label: region_tr_ytd(INDEX_NAME)
+                    if lbl == "Current"
+                    else self._annualized_return_in_window(INDEX_NAME, dict(periods)[lbl])),
+            ):
+                v = fetch()
+                self._val(ws.cell(row=row, column=col0 + offset),
+                          v if v is not None else "", fmt=fmt, color=COLOR_FORMULA)
+                c = ws.cell(row=row, column=col0 + offset)
+                c.fill = PatternFill("solid", start_color=COLOR_INDEX_BG)
+                self._font(c, bold=True)
 
-        ws.freeze_panes = "C7"
+        ws.freeze_panes = "B7"
 
     # --------- By Rating ----------
     def build_by_rating(self):
