@@ -841,6 +841,57 @@ class Builder:
                     return self.weight_dates[i]
         return None
 
+    @staticmethod
+    def _window_cutoff(anchor: datetime, months: int) -> datetime:
+        """Return `anchor - months` as a date, using naive month arithmetic.
+        Robust for the monthly/daily grids on this dashboard."""
+        cutoff_year = anchor.year - months // 12
+        cutoff_month = anchor.month - (months % 12)
+        while cutoff_month <= 0:
+            cutoff_month += 12
+            cutoff_year -= 1
+        return datetime(cutoff_year, cutoff_month, 1)
+
+    def _avg_in_window(
+        self,
+        dates: List[datetime],
+        values: List[Optional[float]],
+        months: int,
+    ) -> Optional[float]:
+        """Arithmetic mean of `values` whose corresponding `dates` fall in the
+        last `months` months. Skips None. Returns None if no obs in window."""
+        if not dates or not values:
+            return None
+        cutoff = self._window_cutoff(dates[-1], months)
+        nums = [v for d, v in zip(dates, values) if d >= cutoff and v is not None]
+        if not nums:
+            return None
+        return sum(nums) / len(nums)
+
+    def _annualized_return_in_window(self, country: str, months: int) -> Optional[float]:
+        """Annualized geometric total return over the last `months` of self.dates
+        for country, computed from the cumulative total return index. Returns a
+        decimal (e.g., 0.085 = 8.5% annualized). Returns None if insufficient data."""
+        vals = self.series.get((country, METRICS["tret"]))
+        if not vals or not self.dates:
+            return None
+        cutoff = self._window_cutoff(self.dates[-1], months)
+        start_v: Optional[float] = None
+        end_v: Optional[float] = None
+        for d, v in zip(self.dates, vals):
+            if v is None:
+                continue
+            if d >= cutoff and start_v is None:
+                start_v = v
+            end_v = v
+        if start_v in (None, 0) or end_v is None:
+            return None
+        years = months / 12.0
+        try:
+            return (end_v / start_v) ** (1.0 / years) - 1.0
+        except (ValueError, ZeroDivisionError):
+            return None
+
     # --------- cell helpers ----------
     def _font(self, cell, **kw):
         d = {"name": FONT_NAME, "size": 10}
@@ -1429,6 +1480,186 @@ class Builder:
             self._font(c)
             c.alignment = Alignment(horizontal="right")
             c.border = THIN_BORDER
+
+    # --------- Contribution decomposition ----------
+    def build_contribution(self):
+        """Per-country contribution to index Spread / Yield / TR, computed at
+        the latest snapshot and as country-by-country averages over rolling
+        1y, 3y, and 5y windows. Lets the user chart "who's driving the index"
+        today vs. historically. No charts on this tab — Alberto builds them
+        in Excel and they survive script re-runs because the column layout
+        is stable."""
+        ws = self.wb.create_sheet("Contribution")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "Contribution decomposition — Weight × Metric"
+        self._font(ws["A1"], size=14, bold=True, color=COLOR_HEADER_BG)
+        ws.row_dimensions[1].height = 22
+
+        ws["A2"] = (
+            "Each country's contribution = (country weight %) × (country metric). "
+            "Sum of contributions ≈ headline index value; small tracking error vs. "
+            "the duration-weighted JPM index is expected. Spread/Yield window "
+            "averages are arithmetic means; TR window is annualized geometric return."
+        )
+        ws.merge_cells("A2:R2")
+        self._font(ws["A2"], color=COLOR_NOTE, italic=True)
+        ws["A2"].alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[2].height = 44
+
+        if self.weight_dates and self.dates:
+            ws["A3"] = (
+                f"Latest weights date: {self.weight_dates[-1]:%Y-%m-%d} · "
+                f"Latest returns date: {self.dates[-1]:%Y-%m-%d}"
+            )
+            self._font(ws["A3"], color=COLOR_NOTE, italic=True)
+
+        # Period blocks
+        periods: List[Tuple[str, int]] = [
+            ("Current", 0),
+            ("1y avg",  12),
+            ("3y avg",  36),
+            ("5y avg",  60),
+        ]
+
+        grp_row = 5
+        hdr_row = 6
+        first_data_row = hdr_row + 1
+
+        col_headers = ["Weight %", "Spread (bps)", "Yield %", "TR %",
+                       "Contrib Spread", "Contrib Yield", "Contrib TR"]
+
+        # Region + Country labels (span both header rows)
+        self._hdr(ws.cell(row=grp_row, column=1), "Region")
+        self._hdr(ws.cell(row=grp_row, column=2), "Country")
+        ws.merge_cells(start_row=grp_row, start_column=1, end_row=hdr_row, end_column=1)
+        ws.merge_cells(start_row=grp_row, start_column=2, end_row=hdr_row, end_column=2)
+        ws.column_dimensions["A"].width = 12
+        ws.column_dimensions["B"].width = 22
+
+        period_col_starts: Dict[str, int] = {}
+        col = 3
+        for label, _ in periods:
+            period_col_starts[label] = col
+            grp_cell = ws.cell(row=grp_row, column=col, value=label)
+            grp_cell.fill = PatternFill("solid", start_color=COLOR_INDEX_BG)
+            self._font(grp_cell, bold=True)
+            grp_cell.alignment = Alignment(horizontal="center")
+            grp_cell.border = THIN_BORDER
+            ws.merge_cells(start_row=grp_row, start_column=col,
+                           end_row=grp_row, end_column=col + len(col_headers) - 1)
+            for j, h in enumerate(col_headers):
+                self._hdr(ws.cell(row=hdr_row, column=col + j), h)
+                ws.column_dimensions[get_column_letter(col + j)].width = 13
+            col += len(col_headers)
+
+        ytd_idx = self.year_start_index(datetime.now().year)
+        spread_metric = METRICS["spread"]
+        yield_metric  = METRICS["yield"]
+        tret_metric   = METRICS["tret"]
+
+        row = first_data_row
+        for region in REGION_ORDER:
+            countries = self.countries_by_region.get(region, [])
+            if not countries:
+                continue
+            # Region banner row (single cell across; data cells stay blank
+            # so SUM at the bottom isn't polluted).
+            self._region_lbl(ws.cell(row=row, column=1), region)
+            for c in range(2, col):
+                cell = ws.cell(row=row, column=c, value="")
+                cell.fill = PatternFill("solid", start_color=COLOR_REGION_BG)
+                cell.border = THIN_BORDER
+            row += 1
+
+            for country in countries:
+                ws.cell(row=row, column=1, value="").border = THIN_BORDER
+                name_cell = ws.cell(row=row, column=2, value=country)
+                name_cell.border = THIN_BORDER
+                self._font(name_cell)
+                name_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                for label, months in periods:
+                    col0 = period_col_starts[label]
+
+                    if months == 0:
+                        w  = self.latest_weight(country)
+                        sp = self.latest_value(country, spread_metric)
+                        yd = self.latest_value(country, yield_metric)
+                        tr_end   = self.latest_value(country, tret_metric)
+                        tr_start = (self.value_at(country, tret_metric, ytd_idx)
+                                    if ytd_idx is not None else None)
+                        if tr_end is not None and tr_start not in (None, 0):
+                            tr = (tr_end / tr_start) - 1.0   # YTD as decimal
+                        else:
+                            tr = None
+                    else:
+                        w  = self._avg_in_window(self.weight_dates,
+                                                 self.weight_series.get(country) or [],
+                                                 months)
+                        sp = self._avg_in_window(self.dates,
+                                                 self.series.get((country, spread_metric)) or [],
+                                                 months)
+                        yd = self._avg_in_window(self.dates,
+                                                 self.series.get((country, yield_metric)) or [],
+                                                 months)
+                        tr = self._annualized_return_in_window(country, months)
+
+                    # Raw values
+                    self._val(ws.cell(row=row, column=col0 + 0),
+                              w  if w  is not None else "", fmt="0.00", color=COLOR_HARDCODE)
+                    self._val(ws.cell(row=row, column=col0 + 1),
+                              sp if sp is not None else "", fmt="0",    color=COLOR_HARDCODE)
+                    self._val(ws.cell(row=row, column=col0 + 2),
+                              yd if yd is not None else "", fmt="0.00", color=COLOR_HARDCODE)
+                    self._val(ws.cell(row=row, column=col0 + 3),
+                              tr if tr is not None else "", fmt="0.00%;(0.00%);-",
+                              color=COLOR_HARDCODE)
+
+                    # Contributions: weight is percent (e.g. 5.0 = 5%),
+                    # spread is bps, yield is %, tr is decimal.
+                    # Contrib Spread (bps)  = w/100 * sp
+                    # Contrib Yield (%)     = w/100 * yd
+                    # Contrib TR (decimal)  = w/100 * tr   (displayed as %)
+                    self._val(ws.cell(row=row, column=col0 + 4),
+                              (w * sp / 100.0) if (w is not None and sp is not None) else "",
+                              fmt="0.0")
+                    self._val(ws.cell(row=row, column=col0 + 5),
+                              (w * yd / 100.0) if (w is not None and yd is not None) else "",
+                              fmt="0.000")
+                    self._val(ws.cell(row=row, column=col0 + 6),
+                              (w * tr / 100.0) if (w is not None and tr is not None) else "",
+                              fmt="0.00%;(0.00%);-")
+                row += 1
+
+        # Total row: SUM each numeric column (region banner rows are blank, so
+        # they don't disturb the SUM).
+        last_data_row = row - 1
+        self._index_lbl(ws.cell(row=row, column=1), "INDEX")
+        self._index_lbl(ws.cell(row=row, column=2), "TOTAL (sum)")
+        for label, _ in periods:
+            col0 = period_col_starts[label]
+            sum_cols = {
+                col0 + 0: "0.00",                  # weight sums to ~100
+                col0 + 4: "0.0",                   # spread contribution in bps
+                col0 + 5: "0.000",                 # yield contribution in %
+                col0 + 6: "0.00%;(0.00%);-",       # TR contribution as %
+            }
+            for c_idx, fmt in sum_cols.items():
+                letter = get_column_letter(c_idx)
+                cell = ws.cell(row=row, column=c_idx)
+                cell.value = f"=SUM({letter}{first_data_row}:{letter}{last_data_row})"
+                cell.number_format = fmt
+                cell.fill = PatternFill("solid", start_color=COLOR_INDEX_BG)
+                self._font(cell, bold=True)
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                cell.border = THIN_BORDER
+            # Blank pad cells so the row reads cleanly
+            for offset in (1, 2, 3):
+                pad = ws.cell(row=row, column=col0 + offset, value="")
+                pad.fill = PatternFill("solid", start_color=COLOR_INDEX_BG)
+                pad.border = THIN_BORDER
+
+        ws.freeze_panes = "C7"
 
     # --------- By Rating ----------
     def build_by_rating(self):
@@ -2887,6 +3118,7 @@ class Builder:
         self._build_timeseries_sheet("Spreads", "spread", "bps", "0", "+0;-0;0")
         self._build_timeseries_sheet("Yields",  "yield",  "% YTM", "0.00", "+0.00;-0.00;0.00")
         self.build_tret_ytd()
+        self.build_contribution()
         self.build_by_rating()
         self.build_snapshot()
         self.build_latam_focus()
