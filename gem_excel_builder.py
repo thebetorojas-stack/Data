@@ -372,23 +372,13 @@ def _compute_row(bond, data, schema):
     analyst = data.analyst_for_gk(gk) or '-'
     comment = (bond.get('WMR_Bond_Comment') or '').strip() or '-'
 
-    from gem_report_builder_v3 import (
-        MIFID_COMPLEX_COVER_TYPES, MIFID_COMPLEX_FOTYPE_KEYWORDS,
-        PRIIPS_KID_AUTO_APPLY, KID_MISSING_ISINS,
-    )
-    ct  = (bond.get('Covered Type') or '').strip().upper()
-    rdm = (bond.get('redeemable')   or '').strip().upper()
-    rtc = (bond.get('retractable')  or '').strip().upper()
-    fot = (bond.get('FOType')       or '').strip().lower()
-    is_complex = (ct in MIFID_COMPLEX_COVER_TYPES or rdm == 'Y' or rtc == 'Y'
-                  or any(kw in fot for kw in MIFID_COMPLEX_FOTYPE_KEYWORDS))
-    restrictions = []
-    if is_complex: restrictions.append(1)
-    if PRIIPS_KID_AUTO_APPLY and is_complex:
-        restrictions.append(2)
-    elif isin in KID_MISSING_ISINS:
-        restrictions.append(2)
-    restrictions_str = ', '.join(str(r) for r in restrictions) if restrictions else '1'
+    # Restrictions: authoritative lookup via the shared GEMData logic so the
+    # Excel and PDF always agree. Reads the PRIIPS reference keyed by ISIN
+    # (Valoren fallback); falls back to the legacy heuristic only when no
+    # reference file was supplied. NOTE: this replaces the old behaviour that
+    # forced a minimum of "1" on every bond — bonds the reference marks
+    # Non-Complex now correctly show blank.
+    restrictions_str = data.restriction_for(isin, valor, bond)
     issuer_desc = data.issuer_description_text(gk) or '-'
 
     row = [

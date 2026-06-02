@@ -54,6 +54,13 @@ This module is organised into the numbered sections below (search for the
   • Change which bonds hit reference lists . edit GEMData.reference_list_bonds(sec 6)
   • Change a single bond row's displayed
     values (ratings, region, yield, etc.) .. edit GEMData.bond_row    (section 6)
+  • Change how RESTRICTIONS (1 / 2 / n/a) are
+    assigned ................................ edit _restriction_from_flags +
+                                              AUTHORITATIVE RESTRICTION SOURCE (sec 2)
+      Restrictions are now looked up per ISIN from the authoritative PRIIPS
+      reference file passed via --priips-ref (NOT guessed from bond features).
+      Supply that file every week; without it the run falls back to the old
+      heuristic and prints a warning.
 
 DATA SOURCES (how the seven input files relate)
   • bond-data      — one row per security (price, coupon, maturity, ISIN…)
@@ -245,8 +252,139 @@ NO_RATING_TOKENS = {'N.A.', 'NA', 'N/A', 'NR', 'WR', '-', ''}
 # bond that also trips Rule 1), restriction "2" co-applies. Set this to False
 # if you have a reliable KID-availability source and want restriction "2" to
 # apply ONLY to ISINs in KID_MISSING_ISINS.
+#
+# NOTE (2026-06): the constants above now only drive the *fallback* heuristic
+# (see GEMData._heuristic_restriction). When an authoritative PRIIPS reference
+# file is supplied (--priips-ref), restrictions are looked up per ISIN from the
+# real MiFID/PRIIPS flags instead — see AUTHORITATIVE RESTRICTION SOURCE below.
 PRIIPS_KID_AUTO_APPLY = True
 KID_MISSING_ISINS = set()   # used only when PRIIPS_KID_AUTO_APPLY = False
+
+# ---- AUTHORITATIVE RESTRICTION SOURCE (PRIIPS reference file) ----------------
+# The restrictions column (1 = MiFID complex, 2 = PRIIPS-relevant w/ no KID) is
+# derived from the firm's authoritative instrument-classification extract — the
+# same data the legacy MS-Access process consumed — rather than guessed from
+# bond features. Supply the file via --priips-ref (or paths['priips_ref']). It
+# may be .xls / .xlsx / .csv and MUST contain these columns:
+#
+#     U_ISIN | VALOREN_NO | MIFIDII_COMPLEXITY | PRIIPS_RELEVANT | PRIIPS_KID
+#
+# Rule (matches the legacy VB expression, faithfully reproduced):
+#   MiFID part:   "Complex Instrument (M10C01)"     -> "1"
+#                 "Non Complex Instrument (M10C02)" -> ""        (blank)
+#                 anything else / missing           -> "n/a"
+#   PRIIPS part:  PRIIPS_RELEVANT and PRIIPS_KID != "Y" -> append "2"
+#                 otherwise                              -> nothing
+#
+# Behaviour when no reference file is supplied: the pipeline degrades to the
+# legacy heuristic (below) for ALL bonds and prints a loud warning, so a run
+# never crashes for lack of the file.
+#
+# Behaviour when the file IS supplied but a specific bond is absent from it
+# (typically brand-new issues not yet in the weekly extract): the bond gets
+# PRIIPS_UNMATCHED_RESTRICTION and is recorded in data.priips_unmatched for the
+# audit report, so it is visible rather than silently guessed.
+PRIIPS_UNMATCHED_RESTRICTION = 'n/a'
+
+# Recognised flag literals (kept as constants so a future rename of the source
+# vocabulary is a one-line change).
+MIFID_COMPLEX_LITERAL     = 'Complex Instrument (M10C01)'
+MIFID_NONCOMPLEX_LITERAL  = 'Non Complex Instrument (M10C02)'
+PRIIPS_RELEVANT_LITERAL   = 'PRIIPS_RELEVANT'
+
+
+def _restriction_from_flags(mifid_complexity, priips_relevant, priips_kid):
+    """Faithful re-implementation of the legacy VB restriction expression.
+
+    Returns the comma-joined restriction string ('', '1', '2', '1, 2',
+    'n/a', 'n/a, 2')."""
+    mc  = (mifid_complexity or '').strip()
+    pr  = (priips_relevant  or '').strip()
+    kid = (priips_kid       or '').strip().upper()
+
+    if mc == MIFID_COMPLEX_LITERAL:
+        mifid_part = '1'
+    elif mc == MIFID_NONCOMPLEX_LITERAL:
+        mifid_part = ''
+    else:
+        mifid_part = 'n/a'
+
+    priips_part = '2' if (pr == PRIIPS_RELEVANT_LITERAL and kid != 'Y') else ''
+
+    parts = [p for p in (mifid_part, priips_part) if p]
+    return ', '.join(parts)
+
+
+def load_priips_reference(path):
+    """Load the authoritative PRIIPS/MiFID classification extract.
+
+    Returns (by_isin, by_valor) dicts mapping the key -> (mifid_complexity,
+    priips_relevant, priips_kid). Accepts .xlsx (openpyxl), .xls (xlrd) or
+    delimited .csv/.txt. Raises a clear error if the file can't be read or is
+    missing the required columns."""
+    import os
+    REQUIRED = ('U_ISIN', 'VALOREN_NO', 'MIFIDII_COMPLEXITY',
+                'PRIIPS_RELEVANT', 'PRIIPS_KID')
+
+    ext = os.path.splitext(path)[1].lower()
+
+    def _emit(header, row_iter):
+        idx = {h: i for i, h in enumerate(header)}
+        missing = [c for c in REQUIRED if c not in idx]
+        if missing:
+            raise ValueError(
+                f'PRIIPS reference {path!r} is missing required column(s): '
+                f'{", ".join(missing)}. Found: {", ".join(map(str, header))}')
+        by_isin, by_valor = {}, {}
+        for r in row_iter:
+            def g(col):
+                v = r[idx[col]] if idx[col] < len(r) else None
+                return None if v is None else str(v).strip()
+            rec = (g('MIFIDII_COMPLEXITY'), g('PRIIPS_RELEVANT'), g('PRIIPS_KID'))
+            isin = g('U_ISIN')
+            valor = g('VALOREN_NO')
+            if isin:
+                by_isin[isin] = rec
+            if valor:
+                # Normalise '32399689.0' / '32399689' -> '32399689'
+                try:
+                    valor = str(int(float(valor)))
+                except (ValueError, TypeError):
+                    pass
+                by_valor[valor] = rec
+        return by_isin, by_valor
+
+    if ext == '.xlsx':
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+        rows = ws.iter_rows(values_only=True)
+        header = list(next(rows))
+        return _emit(header, rows)
+
+    if ext == '.xls':
+        try:
+            import xlrd
+        except ImportError as e:
+            raise ImportError(
+                f'Reading the .xls PRIIPS reference {path!r} requires the '
+                f'`xlrd` package. Either `pip install xlrd`, or re-save the '
+                f'file as .xlsx / .csv and point --priips-ref at that.') from e
+        book = xlrd.open_workbook(path)
+        sh = book.sheet_by_index(0)
+        header = sh.row_values(0)
+        rows = (sh.row_values(i) for i in range(1, sh.nrows))
+        return _emit(header, rows)
+
+    # delimited text
+    import csv as _csv
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        sample = f.read(4096)
+        f.seek(0)
+        delim = '\t' if sample.count('\t') > sample.count(',') else ','
+        reader = _csv.reader(f, delimiter=delim)
+        header = next(reader)
+        return _emit(header, reader)
 
 # ---- Currencies to EXCLUDE from reference lists ------------------------------
 # Reference-list pages (Bonds in X, Region) are NOT generated for these codes.
@@ -756,6 +894,28 @@ class GEMData:
         print('[data] loading issuer texts…');     self.issuer_texts   = load_issuer_texts(paths['issuer_texts'])
         print('[data] loading ratings…');          self.issuer_ratings = load_issuer_ratings(paths['issuer_ratings'])
 
+        # Authoritative MiFID/PRIIPS restriction source (optional but strongly
+        # preferred). When absent we fall back to the legacy heuristic for every
+        # bond and warn loudly. `priips_unmatched` collects bonds present in the
+        # list but absent from the reference, for the audit report.
+        self.priips_ref = {}
+        self.priips_ref_valor = {}
+        self.priips_unmatched = []
+        _pr_path = paths.get('priips_ref')
+        if _pr_path:
+            print('[data] loading PRIIPS reference…')
+            try:
+                self.priips_ref, self.priips_ref_valor = load_priips_reference(_pr_path)
+                print(f'[data] PRIIPS reference: {len(self.priips_ref):,} ISINs, '
+                      f'{len(self.priips_ref_valor):,} valors')
+            except Exception as e:
+                print(f'[data] WARNING: could not load PRIIPS reference '
+                      f'({e}); falling back to legacy heuristic for ALL bonds.')
+                self.priips_ref, self.priips_ref_valor = {}, {}
+        else:
+            print('[data] WARNING: no --priips-ref supplied; restrictions will '
+                  'use the legacy heuristic (less accurate) for ALL bonds.')
+
         # Optional prior week for Changes/Additions/Deletions
         self.prev_bond_updates = {}
         self.prev_bonds = {}
@@ -1149,6 +1309,60 @@ class GEMData:
                 return d
         return ''
 
+    # ----------------------------------------------------------- restrictions
+
+    def restriction_for(self, isin, valor='', bond=None):
+        """Authoritative restrictions string for one bond.
+
+        Looks the bond up in the PRIIPS reference by ISIN (Valoren fallback)
+        and applies the legacy MiFID/PRIIPS rule to the real flags. If no
+        reference was loaded at all, every bond uses the legacy heuristic. If a
+        reference was loaded but this bond is absent, it gets
+        PRIIPS_UNMATCHED_RESTRICTION and is recorded for the audit report."""
+        isin  = (isin or '').strip()
+        valor = (valor or '').strip()
+
+        # No reference at all -> legacy heuristic for everyone.
+        if not self.priips_ref and not self.priips_ref_valor:
+            return self._heuristic_restriction(bond)
+
+        rec = self.priips_ref.get(isin)
+        if rec is None and valor:
+            v = valor
+            try:
+                v = str(int(float(valor)))
+            except (ValueError, TypeError):
+                pass
+            rec = self.priips_ref_valor.get(v)
+
+        if rec is not None:
+            return _restriction_from_flags(*rec)
+
+        # In the list but not in the reference (usually a brand-new issue).
+        self.priips_unmatched.append((isin, valor,
+                                      (bond.get('IssuerName') if bond else '') or ''))
+        return PRIIPS_UNMATCHED_RESTRICTION
+
+    def _heuristic_restriction(self, bond):
+        """Legacy feature-based guess, used only when no PRIIPS reference is
+        available. Kept verbatim from the pre-2026-06 logic so a reference-less
+        run reproduces the old output exactly."""
+        if not bond:
+            return ''
+        cover_type  = (bond.get('Covered Type') or '').strip().upper()
+        redeemable  = (bond.get('redeemable')   or '').strip().upper()
+        retractable = (bond.get('retractable')  or '').strip().upper()
+        fo_type     = (bond.get('FOType')       or '').strip().lower()
+        is_complex = (cover_type in MIFID_COMPLEX_COVER_TYPES
+                      or redeemable == 'Y' or retractable == 'Y'
+                      or any(kw in fo_type for kw in MIFID_COMPLEX_FOTYPE_KEYWORDS))
+        parts = []
+        if is_complex:
+            parts.append('1')
+        if PRIIPS_KID_AUTO_APPLY and is_complex:
+            parts.append('2')
+        return ', '.join(parts)
+
     # ------------------------------------------------------------------ bond row
 
     def bond_row(self, b):
@@ -1196,36 +1410,11 @@ class GEMData:
         green = GREEN_LABELS.get((b.get('GreenBond') or '').strip().upper(), '')
 
         # ---- Restrictions column ------------------------------------------
-        # Derived via rules in the CONFIG block. Plain-vanilla senior bullet
-        # bonds (redeemable=N, retractable=N, SEN, FOType='straight bond')
-        # have no embedded derivatives → no restrictions applied.
-        rest_parts = []
-
-        cover_type   = (b.get('Covered Type') or '').strip().upper()
-        redeemable   = (b.get('redeemable')   or '').strip().upper()
-        retractable  = (b.get('retractable')  or '').strip().upper()
-        fo_type      = (b.get('FOType')       or '').strip().lower()
-
-        has_complex_cover   = cover_type in MIFID_COMPLEX_COVER_TYPES
-        has_embedded_option = (redeemable == 'Y' or retractable == 'Y')
-        has_complex_fotype  = any(kw in fo_type for kw in MIFID_COMPLEX_FOTYPE_KEYWORDS)
-
-        is_complex = has_complex_cover or has_embedded_option or has_complex_fotype
-
-        # Rule 1: MiFID "Complex bond"
-        if is_complex:
-            rest_parts.append('1')
-
-        # Rule 2: PRIIPs KID missing. For EM bonds, non-EEA issuers don't
-        # register KIDs, so restriction 2 co-applies with restriction 1 by
-        # default. Override per-ISIN via KID_MISSING_ISINS if needed.
-        if PRIIPS_KID_AUTO_APPLY:
-            if is_complex:
-                rest_parts.append('2')
-        elif isin in KID_MISSING_ISINS:
-            rest_parts.append('2')
-
-        restrictions = ', '.join(rest_parts)
+        # Authoritative lookup against the PRIIPS reference file keyed by ISIN
+        # (Valoren fallback). See restriction_for / load_priips_reference. When
+        # no reference is supplied this transparently falls back to the legacy
+        # feature heuristic.
+        restrictions = self.restriction_for(isin, valor, b)
 
         # IG/HY grade: use the classifier's decision so unrated sub bonds
         # (subordinated_unrated, subordinated_hy) end up in the speculative
@@ -3362,6 +3551,11 @@ def main():
     ap.add_argument('--issuer-ratings',  required=True)
     ap.add_argument('--prev-bond-data',  default=None)
     ap.add_argument('--prev-bond-update',default=None)
+    ap.add_argument('--priips-ref',      default=None,
+                    help='Authoritative MiFID/PRIIPS classification extract '
+                         '(.xls/.xlsx/.csv) keyed by U_ISIN/VALOREN_NO. Drives '
+                         'the Restrictions column. If omitted, falls back to '
+                         'the legacy feature heuristic.')
     ap.add_argument('--logo',            default=DEFAULT_LOGO_PATH)
     ap.add_argument('--output',          default='GEM_List.pdf')
     ap.add_argument('--xlsx-offshore', default='outputs/GEM_List_Offshore.xlsx')
@@ -3379,6 +3573,7 @@ def main():
         'issuer_ratings':  args.issuer_ratings,
         'prev_bond_data':  args.prev_bond_data,
         'prev_bond_update':args.prev_bond_update,
+        'priips_ref':      args.priips_ref,
     }
 
     data = GEMData(paths)
@@ -3427,6 +3622,23 @@ def _write_audit_reports(data, pdf_output_path):
             w.writerow(row)
     print(f'[audit] wrote {rat_path} ({len(data.ratings_consistency_report)} rows, '
           f'{sum(1 for r in data.ratings_consistency_report if r["discrepancy"])} discrepancies)')
+
+    # Bonds present in the list but absent from the PRIIPS reference (usually
+    # brand-new issues). These received PRIIPS_UNMATCHED_RESTRICTION — listing
+    # them flags exactly which ISINs the next reference extract needs to cover.
+    unm_path = os.path.join(out_dir, 'priips_unmatched_report.csv')
+    seen, unmatched = set(), []
+    for row in getattr(data, 'priips_unmatched', []):
+        if row[0] not in seen:
+            seen.add(row[0])
+            unmatched.append(row)
+    with open(unm_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['isin', 'valor', 'issuer'])
+        for row in sorted(unmatched, key=lambda r: (r[2] or '').lower()):
+            w.writerow(row)
+    print(f'[audit] wrote {unm_path} ({len(unmatched)} '
+          f'bonds not found in PRIIPS reference)')
 
 
 if __name__ == '__main__':
