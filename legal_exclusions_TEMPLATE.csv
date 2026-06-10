@@ -1,0 +1,21 @@
+# ===========================================================================
+# LEGAL / COMPLIANCE REMOVALS
+# ===========================================================================
+# STEP 1.  Copy this file and rename the copy to:   legal_exclusions.csv
+# STEP 2.  Put it in the  data  folder (next to current/ and previous/).
+# STEP 3.  Type the removals in the rows BELOW the line that says
+#          "PLACE LEGAL REMOVALS BELOW THIS ROW" -- ONE PER ROW.
+#          Each row can be EITHER:
+#               - an ISIN            (e.g.  XS1234567890)
+#               - a whole issuer name (e.g. Saudi National Bank)
+#                 ^ this removes ALL of that issuer's bonds at once
+# STEP 4.  Save, then run run_weekly.py again. Done.
+#
+# Notes: lines starting with #  are ignored. You don't have to put ISINs and
+# names in separate columns -- just one item per row in the first column.
+# To put something back, delete its row and re-run.
+# ===========================================================================
+PLACE LEGAL REMOVALS BELOW THIS ROW
+
+
+

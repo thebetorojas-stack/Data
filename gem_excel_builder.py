@@ -345,13 +345,22 @@ def _compute_row(bond, data, schema):
     if coupon is not None:
         coupon = coupon / 100
     px      = _num(bond.get('PXASK_ExecDesk'))
-    # YTM is meaningless for floaters — the ExecDesk feed often emits 0.0.
-    # Replace with the string 'n/a' so Excel doesn't show a misleading 0%.
+    # Yield handling — MUST mirror GEMData.bond_row() in the PDF module so the
+    # two outputs agree. A PURE floating-rate note has no meaningful YTM and the
+    # ExecDesk feed emits 0/blank for it → show 'n/a'. But a FIXED-TO-FLOAT
+    # instrument (CpnType 'fixed/variable' — AT1/T2 bank capital, corporate
+    # hybrids: fixed coupon to first call, then floats) carries a genuine
+    # yield-to-call in the feed and must show it. So suppress only when a
+    # floater-type bond comes through with a missing/~zero feed value.
     cpn_type_raw = (bond.get('CpnType') or '').strip().lower()
     fo_type_raw  = (bond.get('FOType')  or '').strip().lower()
     is_floater   = (cpn_type_raw in ('variable', 'fixed/variable') or
                     'float' in fo_type_raw)
-    yld     = 'n/a' if is_floater else _num(bond.get('YLDASK_ExecDesk'))
+    _yld_num = _num(bond.get('YLDASK_ExecDesk'))
+    if is_floater and (_yld_num is None or abs(_yld_num) < 1e-6):
+        yld = 'n/a'
+    else:
+        yld = _yld_num
     minamt  = _num(bond.get('MinAmt'))
     mininc  = _num(bond.get('MinInc'))
     amtout  = _num(bond.get('AmtOutstanding'))

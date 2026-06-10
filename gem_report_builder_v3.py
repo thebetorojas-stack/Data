@@ -315,6 +315,64 @@ def _restriction_from_flags(mifid_complexity, priips_relevant, priips_kid):
     return ', '.join(parts)
 
 
+# Header/label cells that may appear in the legal-exclusions file but are NOT
+# things to remove. Normalized (lower-case, single-spaced) before comparison.
+_LEGAL_HEADER_SKIP = {
+    'isin', 'isins', 'isin or issuer name', 'isin or issuer name to remove',
+    'issuer', 'issuer name', 'issuer names', 'issuers', 'issuers to remove',
+    'isins to remove', 'place legal removals here', 'item to remove',
+    'place legal removals below this row', 'legal removals', 'what to remove',
+    'legal / compliance removals', 'legal/compliance removals',
+}
+
+
+def _norm_name(s):
+    """Normalize an issuer name for forgiving comparison: lower-case, collapse
+    runs of whitespace, strip ends."""
+    return ' '.join((s or '').strip().lower().split())
+
+
+def load_legal_exclusions(path):
+    """Load the legal/compliance exclusion list.
+
+    After a run, Legal may ask for issuances to be pulled (conflict-of-interest
+    concerns). The file is meant to be dead simple: one item per row, where each
+    item is EITHER an ISIN OR a whole issuer name (removes all of that issuer's
+    bonds). It tolerates messy input:
+      • any ISIN-shaped token (2 letters + 9 alphanumerics + 1 digit) found in a
+        cell is taken as an ISIN — so 'XS123...' or 'remove XS123...' both work;
+      • any other non-empty cell is treated as an issuer NAME to suppress;
+      • lines beginning with '#' and known header labels are ignored;
+      • works for a bare .txt list, a comma-separated paste, or a CSV.
+
+    Returns (isins, issuers): a set of upper-cased ISINs and a set of normalized
+    issuer-name strings. Both empty if path is falsy or the file has no entries.
+    """
+    import re
+    import csv as _csv
+    isins, issuers = set(), set()
+    if not path:
+        return isins, issuers
+    isin_re = re.compile(r'\b[A-Z]{2}[A-Z0-9]{9}[0-9]\b')
+    with open(path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
+        for row in _csv.reader(f):
+            # Skip a whole row that is a '#' comment.
+            if row and row[0].lstrip().startswith('#'):
+                continue
+            for cell in row:
+                cell = (cell or '').strip()
+                if not cell or cell.startswith('#'):
+                    continue
+                toks = isin_re.findall(cell.upper())
+                if toks:
+                    isins.update(toks)          # cell carries one or more ISINs
+                    continue
+                norm = _norm_name(cell)
+                if norm and norm not in _LEGAL_HEADER_SKIP:
+                    issuers.add(norm)           # treat as an issuer name
+    return isins, issuers
+
+
 def load_priips_reference(path):
     """Load the authoritative PRIIPS/MiFID classification extract.
 
@@ -916,6 +974,64 @@ class GEMData:
             print('[data] WARNING: no --priips-ref supplied; restrictions will '
                   'use the legacy heuristic (less accurate) for ALL bonds.')
 
+        # Legal/compliance exclusion list (optional). ISINs Legal asks us to
+        # pull after the initial run. Applied at the single eligibility
+        # chokepoint (_classify_for_list) so the excluded bonds vanish from
+        # EVERY output — the PDF, both Excels, the ladder and the restrictions
+        # workbook — in one pass, with no by-hand editing. Because the
+        # previous-week diff runs through that same classifier, a pulled bond
+        # never shows up as a 'Deletion' (nor, once cleared, as an 'Addition').
+        # `legal_excluded_applied`/`legal_excluded_missing` are computed against
+        # the full loaded universe for the run summary + audit report.
+        self.legal_exclusions = set()          # ISINs
+        self.legal_excluded_issuers = set()    # normalized issuer-name fragments
+        self.legal_excluded_applied = set()    # ISINs that matched a bond
+        self.legal_excluded_missing = set()    # requested ISINs not in the list
+        self.legal_excluded_issuers_hit = set()    # issuer names that matched ≥1 bond
+        self.legal_excluded_issuers_missing = set()  # issuer names that matched none
+        _le_path = paths.get('legal_exclusions')
+        if _le_path:
+            print('[data] loading legal exclusion list…')
+            try:
+                self.legal_exclusions, self.legal_excluded_issuers = \
+                    load_legal_exclusions(_le_path)
+            except Exception as e:
+                print(f'[data] WARNING: could not load legal exclusion list '
+                      f'({e}); no bonds will be excluded on legal grounds.')
+                self.legal_exclusions, self.legal_excluded_issuers = set(), set()
+            if self.legal_exclusions or self.legal_excluded_issuers:
+                _all_isins = {(b.get('Isin') or '').strip().upper()
+                              for b in self.bonds}
+                self.legal_excluded_applied = self.legal_exclusions & _all_isins
+                self.legal_excluded_missing = self.legal_exclusions - _all_isins
+                # Which issuer-name fragments actually hit a bond this week.
+                if self.legal_excluded_issuers:
+                    for b in self.bonds:
+                        gk = (b.get('GK_Nummer') or '').strip()
+                        bond_names = (self.issuer_display_name(
+                                          gk, fallback=b.get('IssuerName', '')),
+                                      b.get('IssuerName', ''))
+                        norm_names = [_norm_name(n) for n in bond_names if n]
+                        for frag in self.legal_excluded_issuers:
+                            if any(frag in nn for nn in norm_names):
+                                self.legal_excluded_issuers_hit.add(frag)
+                    self.legal_excluded_issuers_missing = (
+                        self.legal_excluded_issuers
+                        - self.legal_excluded_issuers_hit)
+                print(f'[data] legal exclusions: '
+                      f'{len(self.legal_exclusions)} ISIN(s) + '
+                      f'{len(self.legal_excluded_issuers)} issuer name(s) supplied; '
+                      f'{len(self.legal_excluded_applied)} ISIN(s) and '
+                      f'{len(self.legal_excluded_issuers_hit)} issuer name(s) '
+                      f'matched a bond this week.')
+                if self.legal_excluded_missing:
+                    print('[data]   ISIN not found (already gone or typo): '
+                          + ', '.join(sorted(self.legal_excluded_missing)))
+                if self.legal_excluded_issuers_missing:
+                    print('[data]   Issuer name not found (check spelling vs the '
+                          'list): ' + ', '.join(sorted(
+                              self.legal_excluded_issuers_missing)))
+
         # Optional prior week for Changes/Additions/Deletions
         self.prev_bond_updates = {}
         self.prev_bonds = {}
@@ -1012,6 +1128,24 @@ class GEMData:
     # week's datasets will adjust together, so a newly-enforced rule will
     # never advertise itself by appearing in the Deletions section.
 
+    def _is_legally_excluded(self, bond, isin):
+        """True if Legal asked us to pull this bond — either by its ISIN or by
+        its issuer name (which suppresses ALL of that issuer's bonds).
+
+        Issuer matching is forgiving: the supplied name need only appear within
+        the bond's issuer name (both normalized), so 'Saudi National Bank'
+        matches a display name like 'Saudi National Bank (Saudi Arabia)'."""
+        if isin and isin.upper() in self.legal_exclusions:
+            return True
+        if self.legal_excluded_issuers:
+            gk = (bond.get('GK_Nummer') or '').strip()
+            for nm in (self.issuer_display_name(gk, fallback=bond.get('IssuerName', '')),
+                       bond.get('IssuerName', '')):
+                n = _norm_name(nm)
+                if n and any(frag in n for frag in self.legal_excluded_issuers):
+                    return True
+        return False
+
     def _classify_for_list(self, bond, bond_update=None):
         """Decide whether one bond record is eligible for the EM Bond List.
 
@@ -1029,9 +1163,14 @@ class GEMData:
         The decision authority is the analyst-adjusted WMRFlag because it
         reflects a third rating agency that isn't in the CSV inputs.
         """
+        isin = (bond.get('Isin') or '').strip()
         if bond_update is None:
-            isin = (bond.get('Isin') or '').strip()
             bond_update = self.bond_updates.get(isin, {})
+        # Legal/compliance pull takes precedence over everything else. Returned
+        # for BOTH the current and previous week (this method filters both), so
+        # the bond is simply absent — never a spurious Deletion/Addition.
+        if self._is_legally_excluded(bond, isin):
+            return {'eligible': False, 'reason': 'legal_excluded'}
         if (bond_update or {}).get('TopListCategory', '').strip() != 'GEM':
             return {'eligible': False, 'reason': 'not_gem'}
         maturity = (bond.get('Maturity') or '').strip()
@@ -1137,18 +1276,23 @@ class GEMData:
         """Resolve the effective S&P and Moody's ratings for a BOND, then
         classify IG vs HY using the WORSE (higher-tier-number) of the two.
 
-        Lookup precedence (most-specific source first):
-          • S&P:    bond_update.RatingSP  > bond.SP > issuer_ratings[gk].SP
+        Lookup precedence (most-specific source first). BOTH agencies prefer
+        BOND-level sources over issuer-level ones, so the displayed rating
+        reflects the instrument, not the issuer:
+          • S&P:    bond_update.RatingSP  > bond.SP  > issuer_ratings[gk].SP
                   > issuer.SPIssuerRating
-          • Moody's: bond_update.RatingMdy > issuer_ratings[gk].MDY
-                  > issuer.MDYIssuerRating > bond.MDY
+          • Moody's: bond_update.RatingMdy > bond.MDY > issuer_ratings[gk].MDY
+                  > issuer.MDYIssuerRating
 
-        bond_update (PublishableBondDataUpdate.txt) carries BOND-level agency
-        ratings. For subordinated bonds those are typically notched DOWN one
-        or more rungs from the issuer rating — preferring them when present
-        is what makes the displayed rating match the actual bond rating
-        (rather than the issuer rating, which would over-state credit
-        quality for sub debt).
+        bond_update (PublishableBondDataUpdate.txt) and the bond record itself
+        carry BOND-level agency ratings. For subordinated bonds (e.g. Tier 2)
+        those are typically notched DOWN one or more rungs from the issuer
+        rating — preferring them is what makes the displayed rating match the
+        actual bond rating rather than the issuer rating, which would
+        over-state credit quality for sub debt. (Previously the Moody's chain
+        preferred issuer-level sources over bond.MDY, so T2 bonds showed the
+        inflated issuer Moody's, e.g. SNB Aa3; reported by D. McLauchlan
+        Jun-2026. Now symmetric with S&P.)
 
         Returns a dict:
             sp_raw, mdy_raw           – raw strings as found (may be None)
@@ -1174,9 +1318,9 @@ class GEMData:
                    (ir.get('SP') or '').strip() or
                    (issuer.get('SPIssuerRating') or '').strip() or None)
         mdy_raw = ((bond_update.get('RatingMdy') or '').strip() or
+                   (bond.get('MDY') or '').strip() or
                    (ir.get('MDY') or '').strip() or
-                   (issuer.get('MDYIssuerRating') or '').strip() or
-                   (bond.get('MDY') or '').strip() or None)
+                   (issuer.get('MDYIssuerRating') or '').strip() or None)
 
         sp_token  = parse_rating(sp_raw)
         mdy_token = parse_rating(mdy_raw)
@@ -1386,15 +1530,30 @@ class GEMData:
         matur = format_date(b.get('Maturity')) or 'Perpetual'
         matur_dt = _parse_maturity_date(b.get('Maturity')) # for chronological sort
         px    = format_price(b.get('PXASK_ExecDesk'))
-        # Yield-to-maturity is meaningless for floating-rate bonds — the
-        # ExecDesk feed often returns 0.0 for them. Detect FRNs (variable
-        # coupon or 'float' in FOType) and emit 'n/a' instead so readers
-        # don't take a literal 0% YTM as a market signal.
+        # Yield handling for floating / fixed-to-float bonds.
+        #   • A PURE floating-rate note (variable coupon for life) has no
+        #     meaningful yield-to-maturity; the ExecDesk feed returns 0/blank
+        #     for them, and a literal "0.0" would mislead, so emit 'n/a'.
+        #   • A FIXED-TO-FLOAT instrument (CpnType 'fixed/variable' — e.g.
+        #     AT1/T2 bank capital and corporate hybrids: a fixed coupon to the
+        #     first call, then floating) DOES carry a genuine yield-to-call,
+        #     which the feed provides. These must show that value, matching the
+        #     legacy list. (Reported missing by D. McLauchlan, Jun-2026.)
+        # Decision keys off whether the feed actually has a real number, so we
+        # never invent a yield and never hide a real one: suppress only when a
+        # floater-type bond comes through with a missing/~zero feed value.
         cpn_type_raw = (b.get('CpnType') or '').strip().lower()
         fo_type_raw  = (b.get('FOType')  or '').strip().lower()
         is_floater   = (cpn_type_raw in ('variable', 'fixed/variable') or
                         'float' in fo_type_raw)
-        yld   = 'n/a' if is_floater else format_price(b.get('YLDASK_ExecDesk'))
+        try:
+            _yld_num = float(b.get('YLDASK_ExecDesk'))
+        except (TypeError, ValueError):
+            _yld_num = None
+        if is_floater and (_yld_num is None or abs(_yld_num) < 1e-6):
+            yld = 'n/a'
+        else:
+            yld = format_price(b.get('YLDASK_ExecDesk'))
         # Resolve S&P / Moody's via bond_update (BOND-level) + bond + issuer
         # precedence. Passing `upd` makes sub bonds show the notched-down
         # bond rating from PublishableBondDataUpdate rather than the issuer
@@ -2479,6 +2638,34 @@ class GEMPDFBuilder:
         ]))
         self.story.append(sub_two)
 
+        # --- Financial subordinated bonds (additive sub-block) --------------
+        # Added Jun-2026 at the request of the DM-list team (Devinda P. with
+        # Clarissa Chow). This is an ADDITION below the general subordinated-
+        # bond explanation above — it does NOT replace the existing narrative
+        # or the Tier 1 / Upper & Lower Tier 2 table. It calls out where modern
+        # bank/insurance capital (Tier 2, AT1) sits in the ranking. The full-
+        # width light-gray sub-header mirrors the "divided into 2 main tiers"
+        # treatment so it reads as part of the same section.
+        self.story.append(Spacer(1, 2.5*mm))
+        fin_sub_hdr = Table(
+            [[Paragraph('<b>Financial subordinated bonds</b>', s['body_sm'])]],
+            colWidths=[CONTENT_WIDTH])
+        fin_sub_hdr.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1, -1), UBS_LIGHT),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
+            ('TOPPADDING',    (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        self.story.append(fin_sub_hdr)
+        self.story.append(Spacer(1, 1.5*mm))
+        self.story.append(Paragraph(
+            'Tier 2 bank and insurance bonds are subordinated instruments, '
+            'junior in ranking versus senior bonds and senior versus AT1 bonds. '
+            'Coupon payments may be skipped or postponed at the point of '
+            'non-viability, depending on individual instrument terms.',
+            s['body_sm']))
+
     # ------------------------------------------------------------- BOND TABLES
 
     def _bond_table_header(self):
@@ -3556,6 +3743,12 @@ def main():
                          '(.xls/.xlsx/.csv) keyed by U_ISIN/VALOREN_NO. Drives '
                          'the Restrictions column. If omitted, falls back to '
                          'the legacy feature heuristic.')
+    ap.add_argument('--legal-exclusions', default=None,
+                    help='Optional plain-text/CSV list of ISINs that Legal has '
+                         'asked to pull from the published list. Every '
+                         'ISIN-shaped token in the file is removed from ALL '
+                         'outputs; non-ISIN text is ignored. Re-run after '
+                         'editing the file to regenerate everything cleanly.')
     ap.add_argument('--logo',            default=DEFAULT_LOGO_PATH)
     ap.add_argument('--output',          default='GEM_List.pdf')
     ap.add_argument('--xlsx-offshore', default='outputs/GEM_List_Offshore.xlsx')
@@ -3574,6 +3767,7 @@ def main():
         'prev_bond_data':  args.prev_bond_data,
         'prev_bond_update':args.prev_bond_update,
         'priips_ref':      args.priips_ref,
+        'legal_exclusions':args.legal_exclusions,
     }
 
     data = GEMData(paths)
@@ -3622,6 +3816,44 @@ def _write_audit_reports(data, pdf_output_path):
             w.writerow(row)
     print(f'[audit] wrote {rat_path} ({len(data.ratings_consistency_report)} rows, '
           f'{sum(1 for r in data.ratings_consistency_report if r["discrepancy"])} discrepancies)')
+
+    # Legal/compliance exclusions — written whenever a list was supplied, as a
+    # record of exactly which issuances were pulled this run, plus which
+    # requested ISINs / issuer names weren't present (already gone / typo).
+    if getattr(data, 'legal_exclusions', None) or getattr(data, 'legal_excluded_issuers', None):
+        leg_path = os.path.join(out_dir, 'legal_exclusions_applied.csv')
+        with open(leg_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['rule_type', 'requested', 'status', 'isin', 'issuer', 'gk'])
+            # Walk the full universe so we can list EVERY bond actually removed,
+            # whether pulled by ISIN or because its issuer name was suppressed.
+            removed_by_isin = removed_by_issuer = 0
+            for b in data.bonds:
+                isin = (b.get('Isin') or '').strip().upper()
+                gk = (b.get('GK_Nummer') or '').strip()
+                name = data.issuer_display_name(gk, fallback=b.get('IssuerName', ''))
+                norm = _norm_name(name)
+                norm_raw = _norm_name(b.get('IssuerName', ''))
+                if isin and isin in data.legal_exclusions:
+                    w.writerow(['isin', isin, 'removed', isin, name, gk])
+                    removed_by_isin += 1
+                else:
+                    hit = next((frag for frag in data.legal_excluded_issuers
+                                if frag in norm or frag in norm_raw), None)
+                    if hit:
+                        w.writerow(['issuer', hit, 'removed', isin, name, gk])
+                        removed_by_issuer += 1
+            # Requests that matched nothing — surfaced so Legal's ask is verified.
+            for isin in sorted(data.legal_excluded_missing):
+                w.writerow(['isin', isin, 'not_found_in_list', '', '', ''])
+            for frag in sorted(getattr(data, 'legal_excluded_issuers_missing', set())):
+                w.writerow(['issuer', frag, 'not_found_in_list', '', '', ''])
+        print(f'[audit] wrote {leg_path} '
+              f'({removed_by_isin} bond(s) removed by ISIN, '
+              f'{removed_by_issuer} by issuer name; '
+              f'{len(data.legal_excluded_missing)} ISIN + '
+              f'{len(getattr(data, "legal_excluded_issuers_missing", set()))} '
+              f'issuer request(s) not found)')
 
     # Bonds present in the list but absent from the PRIIPS reference (usually
     # brand-new issues). These received PRIIPS_UNMATCHED_RESTRICTION — listing

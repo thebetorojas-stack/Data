@@ -53,7 +53,35 @@ def find_priips_reference():
     return max(candidates, key=os.path.getmtime)
 
 
+def find_legal_exclusions():
+    """Locate the Legal/compliance exclusion list, if one was dropped in.
+
+    After the initial run, Legal may ask for certain issuances to be pulled
+    (conflict-of-interest concerns). Save their ISINs in a file whose name
+    contains 'legal' or 'exclusion' (.txt/.csv) in the data/ folder (or the
+    project root) and re-run — the listed bonds are removed from EVERY output
+    automatically. No file => nothing is excluded (normal run).
+
+    Template/example files are skipped so a sample never silently takes effect.
+    """
+    patterns = []
+    for folder in (DATA, CURR, HERE):
+        for ext in ('txt', 'csv'):
+            for stem in ('*[Ll]egal*', '*[Ee]xclusion*'):
+                patterns.append(os.path.join(folder, stem + '.' + ext))
+    candidates = []
+    for pat in patterns:
+        candidates.extend(glob.glob(pat))
+    skip = ('~$', 'template', 'example', 'sample')
+    candidates = [c for c in set(candidates)
+                  if not any(s in os.path.basename(c).lower() for s in skip)]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
 priips_ref = find_priips_reference()
+legal_excl = find_legal_exclusions()
 
 # Simulate the command-line arguments that gem_report_builder_v3.main() expects
 sys.argv = [
@@ -72,6 +100,14 @@ sys.argv = [
     '--xlsx-onshore',     os.path.join(OUT,  'GEM_List_Onshore.xlsx'),
     '--ladder-output',    os.path.join(OUT,  'LatAm_Bond_Ladder.pdf'),
 ]
+
+if legal_excl:
+    sys.argv += ['--legal-exclusions', legal_excl]
+    print('Using legal exclusion list:', legal_excl)
+else:
+    print('No legal exclusion list found — running with no legal removals. '
+          '(To pull issuances, drop a file named e.g. "legal_exclusions.csv" '
+          'with the ISINs into the', DATA, 'folder and re-run.)')
 
 if priips_ref:
     sys.argv += ['--priips-ref', priips_ref]
