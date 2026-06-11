@@ -60,7 +60,8 @@ import zipfile
 
 from lxml import etree
 
-from gem_report_builder_v3 import country_name, effective_region
+from gem_report_builder_v3 import (country_name, effective_region,
+                                   is_subordinated_bond, parse_rating)
 
 def _has_issuer_name(bond, data):
     gk = (bond.get('GK_Nummer') or '').strip()
@@ -341,6 +342,12 @@ def _compute_row(bond, data, schema):
     eff = data.effective_issuer_rating(gk, bond, upd)
     sp  = eff['sp_token'] or '-'
     mdy = eff['mdy_token'] or '-'
+    # Subordinated bonds: NO issuer fallback (must match the PDF). If the bond
+    # has no rating of its own, show '-' rather than the issuer rating, since
+    # sub debt is riskier than the issuer. Senior bonds keep the issuer cushion.
+    if is_subordinated_bond(bond):
+        sp  = parse_rating((upd.get('RatingSP')  or '').strip() or (bond.get('SP')  or '').strip()) or '-'
+        mdy = parse_rating((upd.get('RatingMdy') or '').strip() or (bond.get('MDY') or '').strip()) or '-'
     coupon  = _num(bond.get('Coupon'))
     if coupon is not None:
         coupon = coupon / 100

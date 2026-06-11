@@ -1277,8 +1277,9 @@ class GEMData:
         classify IG vs HY using the WORSE (higher-tier-number) of the two.
 
         Lookup precedence (most-specific source first). BOTH agencies prefer
-        BOND-level sources over issuer-level ones, so the displayed rating
-        reflects the instrument, not the issuer:
+        BOND-level sources over issuer-level ones, but DO fall back to the
+        issuer rating when the bond carries none of its own — that fallback is
+        a deliberate cushion against data scarcity across the report:
           • S&P:    bond_update.RatingSP  > bond.SP  > issuer_ratings[gk].SP
                   > issuer.SPIssuerRating
           • Moody's: bond_update.RatingMdy > bond.MDY > issuer_ratings[gk].MDY
@@ -1561,6 +1562,14 @@ class GEMData:
         eff   = self.effective_issuer_rating(gk, b, upd)
         sp    = eff['sp_token'] or 'n/a'
         mdy   = eff['mdy_token'] or 'n/a'
+        # Subordinated bonds: NO issuer fallback. Sub debt is riskier than the
+        # issuer, so if the bond has no rating of its own, show n/a rather than
+        # substituting the (higher) issuer rating. Senior bonds keep the issuer
+        # fallback above as a cushion against data gaps. (Per D. McLauchlan /
+        # DM-list team, Jun-2026.)
+        if is_subordinated_bond(b):
+            sp  = parse_rating((upd.get('RatingSP')  or '').strip() or (b.get('SP')  or '').strip()) or 'n/a'
+            mdy = parse_rating((upd.get('RatingMdy') or '').strip() or (b.get('MDY') or '').strip()) or 'n/a'
         rating= f'{sp} / {mdy}'   # "S&P / Moody's"
         min_a = format_int(b.get('MinAmt'))
         min_i = format_int(b.get('MinInc'))
@@ -1684,7 +1693,7 @@ class GEMData:
             'issuer':     issuer,
             'ccy':        (bond.get('CCY') or '').strip().upper(),
             'coupon':     format_percent(bond.get('Coupon')),
-            'maturity':   format_date(bond.get('Maturity')),
+            'maturity':   format_date(bond.get('Maturity')) or 'Perpetual',
             'view_prior': view_prior,
             'view_new':   view_new,
         }
@@ -2561,7 +2570,7 @@ class GEMPDFBuilder:
                 s['body_sm']),
         ]
         left_cell = Table([[p] for p in sub_narrative],
-                          colWidths=[CONTENT_WIDTH / 2 - 2*mm])
+                          colWidths=[CONTENT_WIDTH])
         left_cell.setStyle(TableStyle([
             ('VALIGN',       (0, 0), (-1, -1), 'TOP'),
             ('LEFTPADDING',  (0, 0), (-1, -1), 0),
@@ -2570,73 +2579,10 @@ class GEMPDFBuilder:
             ('BOTTOMPADDING',(0, 0), (-1, -1), 2),
         ]))
 
-        # Right: light-gray sub-header + 3-row label/description tier table
-        right_col_w = CONTENT_WIDTH / 2 - 2*mm
-        tier_label_w = 25*mm
-        tier_desc_w  = right_col_w - tier_label_w
-
-        tier_subhdr = Table(
-            [[Paragraph(
-                '<b>Subordinated debt is divided into 2 main tiers. Tier 1 debt is subordinate to Tier 2 debt.</b>',
-                s['body_sm'])]],
-            colWidths=[right_col_w])
-        tier_subhdr.setStyle(TableStyle([
-            ('BACKGROUND',    (0, 0), (-1, -1), UBS_LIGHT),
-            ('LEFTPADDING',   (0, 0), (-1, -1), 4),
-            ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
-            ('TOPPADDING',    (0, 0), (-1, -1), 3),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-        ]))
-
-        tier_rows = [
-            ('Tier 1',
-             'The maturity of Tier 1 debt is perpetual, however, the issuer has the right to call the bond at '
-             'the earliest after five years, then at each coupon date. Calling the bond is only possible if '
-             'sufficient funds are available for repayment. Interest can be paid on a fixed or floating basis, '
-             'the bond is not collateralised nor guaranteed.'),
-            ('Upper Tier 2',
-             'Upper Tier 2 debt is perpetual, and its coupons are deferrable and cumulative, interest and '
-             'principal can be written down.'),
-            ('Lower Tier 2',
-             'Lower Tier 2 debt has a fixed maturity of at least 5 years and interest payments may only be '
-             'suspended in the case of bankruptcy.'),
-        ]
-        tier_data = []
-        for label, desc in tier_rows:
-            tier_data.append([
-                Paragraph(f'<b>{label}</b>', s['body_sm']),
-                Paragraph(desc, s['body_sm']),
-            ])
-        tier_tbl = Table(tier_data, colWidths=[tier_label_w, tier_desc_w])
-        tier_tbl.setStyle(TableStyle([
-            ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING',   (0, 0), (-1, -1), 4),
-            ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
-            ('TOPPADDING',    (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-            ('LINEBELOW',     (0, 0), (-1, -2), 0.25, UBS_HEADER_BG),
-        ]))
-
-        right_cell = Table(
-            [[tier_subhdr], [tier_tbl]],
-            colWidths=[right_col_w])
-        right_cell.setStyle(TableStyle([
-            ('VALIGN',       (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING',  (0, 0), (-1, -1), 0),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-            ('TOPPADDING',   (0, 0), (-1, -1), 0),
-            ('BOTTOMPADDING',(0, 0), (-1, -1), 0),
-        ]))
-
-        sub_two = Table(
-            [[left_cell, right_cell]],
-            colWidths=[CONTENT_WIDTH / 2, CONTENT_WIDTH / 2])
-        sub_two.setStyle(TableStyle([
-            ('VALIGN',       (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING',  (0, 0), (-1, -1), 0),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 4*mm),
-        ]))
-        self.story.append(sub_two)
+        # The "Subordinated debt is divided into 2 main tiers" table (Tier 1 /
+        # Upper Tier 2 / Lower Tier 2) was removed Jun-2026 at the DM-list
+        # team's request. Only the narrative above is retained, now full-width.
+        self.story.append(left_cell)
 
         # --- Financial subordinated bonds (additive sub-block) --------------
         # Added Jun-2026 at the request of the DM-list team (Devinda P. with
