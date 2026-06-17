@@ -1584,10 +1584,19 @@ class GEMData:
         # feature heuristic.
         restrictions = self.restriction_for(isin, valor, b)
 
-        # IG/HY grade: use the classifier's decision so unrated sub bonds
-        # (subordinated_unrated, subordinated_hy) end up in the speculative
-        # bucket rather than silently defaulting to IG when WMRFlag is
-        # empty. Senior bonds still trust WMRFlag with bond_update fallback.
+        # IG/HY grade (section placement).
+        #
+        # Subordinated bonds: place by the bond's OWN rating — the very same
+        # bond-level S&P/Moody's tokens shown in the rating column (sp/mdy
+        # above, computed with NO issuer fallback). The bond rating overrides
+        # the analyst WMRFlag for section purposes, so a sub bond rated IG
+        # (e.g. Baa3 / BBB-) is filed under Investment grade even when its
+        # WMRFlag is HY. (Requested Jun-2026 by A. Rojas after T. Boroditskaya
+        # flagged Riyad/Alinma T2 sukuk printing in the HY section purely on
+        # their WMRFlag despite carrying IG bond ratings.) Sub bonds with NO
+        # rating of their own keep prior behaviour — the classifier reason,
+        # which routes unrated / HY-flagged sub debt to the speculative bucket.
+        # Senior bonds: unchanged — trust WMRFlag, then bond_update/agency.
         decision = self._classify_for_list(b, upd)
         sub_reason_to_grade = {
             'subordinated_ig':      'Investment grade issuers',
@@ -1595,7 +1604,20 @@ class GEMData:
             'subordinated_unrated': 'Speculative grade issuers',
         }
         if decision['reason'] in sub_reason_to_grade:
-            grade = sub_reason_to_grade[decision['reason']]
+            # sp / mdy are the bond-level tokens displayed for this sub bond
+            # ('n/a' when it carries no rating of its own). Classify by the
+            # WORSE of the two, matching effective_issuer_rating's worst-of
+            # convention.
+            sub_tiers = [t for t in (rating_tier(sp) if sp != 'n/a' else None,
+                                     rating_tier(mdy) if mdy != 'n/a' else None)
+                         if t is not None]
+            if sub_tiers:
+                grade = ('Investment grade issuers'
+                         if max(sub_tiers) <= IG_MAX_TIER
+                         else 'Speculative grade issuers')
+            else:
+                # Unrated sub bond — keep doing what we have been doing.
+                grade = sub_reason_to_grade[decision['reason']]
         else:
             wmr_flag = ((b.get('WMRFlag') or '').strip().upper() or
                         (upd.get('WMRFlag') or '').strip().upper())
