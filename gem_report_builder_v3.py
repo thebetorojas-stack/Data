@@ -1353,6 +1353,37 @@ class GEMData:
             'status': status,
         }
 
+    def issuer_only_rating(self, gk):
+        """Resolve IG/HY from the ISSUER-level credit rating (TBR) ONLY — no
+        bond-level sources. This is the issuer's own agency rating as carried
+        in IssuerRatings.txt, falling back to the issuer master's
+        SP/MDY IssuerRating fields:
+            • S&P:     issuer_ratings[gk].SP  > issuer.SPIssuerRating
+            • Moody's: issuer_ratings[gk].MDY > issuer.MDYIssuerRating
+
+        Used for subordinated-bond IG/HY SECTION placement so that every bond
+        of an issuer prints in the same grade block, regardless of where the
+        individual instrument is notched. (Requested Jun-2026 by
+        T. Boroditskaya: rely on the issuer-level credit rating so all bonds of
+        an issuer appear in one place — e.g. Alinma's subordinated sukuk files
+        with its IG issuer rather than in the speculative section.)
+
+        Returns {'is_ig': True | False | None} — None when the issuer carries
+        no parseable issuer-level rating at all.
+        """
+        ir     = self.issuer_ratings.get(gk, {}) if gk else {}
+        issuer = self.issuer_record(gk) if gk else {}
+        sp_raw  = ((ir.get('SP') or '').strip() or
+                   (issuer.get('SPIssuerRating') or '').strip() or None)
+        mdy_raw = ((ir.get('MDY') or '').strip() or
+                   (issuer.get('MDYIssuerRating') or '').strip() or None)
+        tiers = [t for t in (rating_tier(parse_rating(sp_raw)),
+                             rating_tier(parse_rating(mdy_raw)))
+                 if t is not None]
+        if not tiers:
+            return {'is_ig': None}
+        return {'is_ig': max(tiers) <= IG_MAX_TIER}
+
     # --------------------------------------------------------- audit & filters
 
     def _build_ratings_consistency_report(self, bonds):
@@ -1586,17 +1617,19 @@ class GEMData:
 
         # IG/HY grade (section placement).
         #
-        # Subordinated bonds: place by the bond's OWN rating — the very same
-        # bond-level S&P/Moody's tokens shown in the rating column (sp/mdy
-        # above, computed with NO issuer fallback). The bond rating overrides
-        # the analyst WMRFlag for section purposes, so a sub bond rated IG
-        # (e.g. Baa3 / BBB-) is filed under Investment grade even when its
-        # WMRFlag is HY. (Requested Jun-2026 by A. Rojas after T. Boroditskaya
-        # flagged Riyad/Alinma T2 sukuk printing in the HY section purely on
-        # their WMRFlag despite carrying IG bond ratings.) Sub bonds with NO
-        # rating of their own keep prior behaviour — the classifier reason,
-        # which routes unrated / HY-flagged sub debt to the speculative bucket.
-        # Senior bonds: unchanged — trust WMRFlag, then bond_update/agency.
+        # Subordinated bonds: place by the ISSUER-level credit rating (TBR),
+        # NOT the bond's own rating, so that every bond of an issuer prints in
+        # the same IG/HY block. So a subordinated bond of an IG issuer is filed
+        # under Investment grade even when the instrument itself is notched to
+        # HY (e.g. Alinma's subordinated sukuk, set up HY in CWB, files with
+        # its IG issuer). (Requested Jun-2026 by T. Boroditskaya: rely on the
+        # issuer-level credit rating to keep all bonds of an issuer published in
+        # one place. This supersedes the Jun-17 bond-level placement.) NOTE: the
+        # displayed rating COLUMN is unchanged — it still shows the bond's own
+        # rating (McLauchlan fix); only the section placement is issuer-driven.
+        # Sub bonds whose issuer carries no parseable issuer-level rating keep
+        # the prior reason-based fallback. Senior bonds: unchanged — already
+        # issuer-level (WMRFlag, then issuer/agency).
         decision = self._classify_for_list(b, upd)
         sub_reason_to_grade = {
             'subordinated_ig':      'Investment grade issuers',
@@ -1604,19 +1637,13 @@ class GEMData:
             'subordinated_unrated': 'Speculative grade issuers',
         }
         if decision['reason'] in sub_reason_to_grade:
-            # sp / mdy are the bond-level tokens displayed for this sub bond
-            # ('n/a' when it carries no rating of its own). Classify by the
-            # WORSE of the two, matching effective_issuer_rating's worst-of
-            # convention.
-            sub_tiers = [t for t in (rating_tier(sp) if sp != 'n/a' else None,
-                                     rating_tier(mdy) if mdy != 'n/a' else None)
-                         if t is not None]
-            if sub_tiers:
-                grade = ('Investment grade issuers'
-                         if max(sub_tiers) <= IG_MAX_TIER
-                         else 'Speculative grade issuers')
+            iss = self.issuer_only_rating(gk)
+            if iss['is_ig'] is True:
+                grade = 'Investment grade issuers'
+            elif iss['is_ig'] is False:
+                grade = 'Speculative grade issuers'
             else:
-                # Unrated sub bond — keep doing what we have been doing.
+                # No issuer-level rating at all — keep prior reason-based bucket.
                 grade = sub_reason_to_grade[decision['reason']]
         else:
             wmr_flag = ((b.get('WMRFlag') or '').strip().upper() or
