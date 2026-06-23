@@ -50,6 +50,7 @@ PREV = os.path.join(DATA, 'previous')
 
 LEGAL_BLOCKED_CSV = os.path.join(HERE, 'legal_blocked.csv')
 GLOBAL_RESTR_CSV  = os.path.join(HERE, 'global_restrictions.csv')
+SOFT_RESTR_CSV    = os.path.join(HERE, 'soft_restrictions.csv')
 OUT_XLSX          = os.path.join(HERE, 'EMBL_Legal_Review.xlsx')
 
 
@@ -156,6 +157,29 @@ def section_global_restrictions(data):
     return rows
 
 
+def section_soft_restrictions(data):
+    """Bottom section — maintained list of 'soft restriction' bonds.
+    Columns differ: ISIN | Issuer | Maturity | Currency | US Onshore?
+    (no coupon). Maturity/Currency come from the file, falling back to the
+    feed when the bond is present this week."""
+    rows = []
+    for r in _read_csv(SOFT_RESTR_CSV):
+        isin = (r.get('isin') or '').strip()
+        if not isin:
+            continue
+        b = _bond(data, isin) or {}
+        rows.append({
+            'isin':     isin,
+            'issuer':   (r.get('issuer') or '').strip() or issuer_short(data, isin),
+            'maturity': (r.get('maturity') or '').strip()
+                        or (gem.format_date(b.get('Maturity')) if b else '') or '',
+            'currency': (r.get('currency') or '').strip()
+                        or (b.get('CCY', '').strip().upper() if b else ''),
+            'onshore':  (r.get('us_onshore') or '').strip() or onshore_flag(data, isin),
+        })
+    return rows
+
+
 # ------------------------------------------------------------------- rendering
 def write_xlsx(data, changes, path):
     import openpyxl
@@ -237,8 +261,17 @@ def write_xlsx(data, changes, path):
                 'flagged by system)')
     col_header(COLS_BASE)
     data_rows(section_global_restrictions(data), base_keys)
+    blank()
 
-    widths = [16, 34, 9, 12, 12, 13, 12]
+    # 6) Soft restrictions (own column layout: Maturity + Currency, no coupon)
+    COLS_SOFT  = ['ISIN', 'Issuer', 'Maturity', 'Currency', 'US Onshore?']
+    soft_keys  = ['isin', 'issuer', 'maturity', 'currency', 'onshore']
+    section_bar('Soft restrictions (no actions, previously approved, '
+                'flagged by system)')
+    col_header(COLS_SOFT)
+    data_rows(section_soft_restrictions(data), soft_keys)
+
+    widths = [16, 34, 12, 12, 12, 13, 12]
     for i, wch in enumerate(widths, start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = wch
     ws.freeze_panes = 'A1'
