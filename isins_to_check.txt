@@ -1,0 +1,5 @@
+# Paste the ISINs people ask about below, one per line.
+# Lines starting with # are ignored. Then run:  python check_isins.py
+# ---------------------------------------------------------------
+XS1234567890
+US40012345AA
