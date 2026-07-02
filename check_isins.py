@@ -16,6 +16,7 @@ import sys
 import datetime
 
 import gem_report_builder_v3 as G
+from gem_report_builder_v3 import EXCLUDED_CURRENCIES
 from gem_excel_builder import is_onshore_eligible, is_offshore_eligible, _has_issuer_name
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -81,17 +82,52 @@ def _find_legal_exclusions():
     return None
 
 
-def assess(isin, data):
-    """Return a dict of answers for one ISIN."""
-    r = {'ISIN': isin, 'In feed?': 'NO', 'On the list?': 'NO',
-         'Reason': '', 'Explanation': '', 'Offshore Excel?': '', 'Onshore Excel?': ''}
+def build_published_sets(data):
+    """Reproduce EXACTLY what each real output contains, by ISIN.
+    These call the same functions the PDF/Excel builders use, so membership
+    can't disagree with the published files."""
+    def isins(bonds):
+        return {(b.get('Isin') or '').strip() for b in bonds}
+    return {
+        # PDF pages
+        'pdf_reference': isins(data.reference_list_bonds()),   # main currency/region tables
+        'pdf_sell':      isins(data.sell_list_bonds()),        # Sell Recommendations page
+        'pdf_top':       isins(data.top_list_bonds()),         # Top List overlay
+        # Excels (eligibility + must have an issuer name)
+        'offshore': isins(b for b in data.em_bonds
+                          if is_offshore_eligible(b, data) and _has_issuer_name(b, data)),
+        'onshore':  isins(b for b in data.em_bonds
+                          if is_onshore_eligible(b, data) and _has_issuer_name(b, data)),
+    }
+
+
+def _why_not_in_pdf(bond, data):
+    """A bond can be eligible yet absent from the PDF's main table. Say why."""
+    rec = (bond.get('WMR_Bond_Recommendation') or '').strip()
+    ccy = (bond.get('CCY') or '').strip().upper()
+    if rec == 'Sell':
+        return 'It is Sell-rated, so it sits on the "Sell Recommendations" page, not the main table.'
+    if not ccy:
+        return 'It has NO currency (CCY blank) in the feed, so the PDF skips it. Data problem - flag to the desk.'
+    if ccy in EXCLUDED_CURRENCIES:
+        return (f'It is in an EXCLUDED currency ({ccy}). Local-currency bonds '
+                f'({", ".join(sorted(EXCLUDED_CURRENCIES))}) are deliberately kept off the list.')
+    if not _has_issuer_name(bond, data):
+        return 'It has NO issuer name in the feed, so it is dropped. Data problem - flag to the desk.'
+    return 'Eligible but not in the main PDF table for another reason - inspect the bond record.'
+
+
+def assess(isin, data, pub):
+    """Return a dict of answers for one ISIN, using REAL published membership."""
+    r = {'ISIN': isin, 'In feed?': 'NO', 'In PDF?': 'NO',
+         'Offshore Excel?': 'NO', 'Onshore Excel?': 'NO',
+         'Reason': '', 'Explanation': '', 'Issuer': ''}
 
     bond = data.bond_by_isin.get(isin)
     if bond is None:
         r['Reason'] = 'not_in_feed'
-        r['Explanation'] = ("This ISIN is not in this week's bond feed at all. "
-                            "It never reached us - check the ISIN is correct, or the "
-                            "desk needs to add it upstream. Nothing this tool can include.")
+        r['Explanation'] = ("Not in this week's bond feed at all. It never reached us - "
+                            "check the ISIN is correct, or the desk needs to add it upstream.")
         return r
 
     r['In feed?'] = 'YES'
@@ -99,26 +135,51 @@ def assess(isin, data):
     gk  = (bond.get('GK_Nummer') or '').strip()
     r['Issuer'] = data.issuer_display_name(gk, fallback=bond.get('IssuerName', ''))
 
+    # First the eligibility gate (drives everything).
     decision = data._classify_for_list(bond, upd)
-    r['Reason'] = decision['reason']
-    r['Explanation'] = EXPLAIN.get(decision['reason'], decision['reason'])
+    if not decision['eligible']:
+        r['Reason'] = decision['reason']
+        r['Explanation'] = EXPLAIN.get(decision['reason'], decision['reason'])
+        return r
 
-    if decision['eligible']:
-        r['On the list?'] = 'YES'
-        r['Offshore Excel?'] = 'YES' if is_offshore_eligible(bond, data) else 'NO'
-        on = is_onshore_eligible(bond, data) and _has_issuer_name(bond, data)
-        r['Onshore Excel?'] = 'YES' if on else 'NO'
-        if r['Offshore Excel?'] == 'YES' and r['Onshore Excel?'] == 'YES':
-            r['Explanation'] = 'It IS on the list (offshore and onshore). If someone says it is missing, check the sheet/tab they are looking at.'
-        elif r['Onshore Excel?'] == 'NO':
-            r['Explanation'] = ('On the master list and Offshore, but NOT on the Onshore Excel '
-                                '(usually: not USD, or a Reg-S / 144A corporate, or an excluded-country sovereign).')
+    # Eligible — now check ACTUAL membership in each real output.
+    in_pdf_main = isin in pub['pdf_reference']
+    in_sell     = isin in pub['pdf_sell']
+    in_off      = isin in pub['offshore']
+    in_on       = isin in pub['onshore']
+    r['In PDF?']         = 'YES' if (in_pdf_main or in_sell) else 'NO'
+    r['Offshore Excel?'] = 'YES' if in_off else 'NO'
+    r['Onshore Excel?']  = 'YES' if in_on else 'NO'
+
+    if in_pdf_main and in_off and in_on:
+        r['Reason'] = 'present'
+        r['Explanation'] = 'It IS in the report (PDF main table + both Excels). Check the tab/section they are looking at.'
+        return r
+
+    # Eligible but missing from at least one output — explain the gaps.
+    bits = []
+    if not (in_pdf_main or in_sell):
+        bits.append('PDF: ' + _why_not_in_pdf(bond, data))
+    elif in_sell and not in_pdf_main:
+        bits.append('PDF: on the Sell Recommendations page, not the main table.')
+    if not in_off:
+        if not _has_issuer_name(bond, data):
+            bits.append('Offshore Excel: dropped - no issuer name in the feed.')
+        else:
+            bits.append('Offshore Excel: not eligible (GEM tag or 180-day maturity).')
+    if not in_on:
+        if not _has_issuer_name(bond, data):
+            bits.append('Onshore Excel: dropped - no issuer name in the feed.')
+        else:
+            bits.append('Onshore Excel: not onshore-eligible (not USD, Reg-S/144A corporate, or excluded-country sovereign).')
+    r['Reason'] = 'eligible_but_filtered'
+    r['Explanation'] = '  |  '.join(bits) if bits else 'Eligible; see membership columns.'
     return r
 
 
 def write_xlsx(rows):
     os.makedirs(OUT_DIR, exist_ok=True)
-    cols = ['ISIN', 'Issuer', 'In feed?', 'On the list?',
+    cols = ['ISIN', 'Issuer', 'In feed?', 'In PDF?',
             'Offshore Excel?', 'Onshore Excel?', 'Reason', 'Explanation']
     try:
         import openpyxl
@@ -132,12 +193,14 @@ def write_xlsx(rows):
             c.fill = PatternFill('solid', fgColor='305496')
         for row in rows:
             ws.append([row.get(c, '') for c in cols])
-            status = row.get('On the list?')
-            fill = '006100' if status == 'YES' else '9C0006'
-            fillbg = 'C6EFCE' if status == 'YES' else 'FFC7CE'
-            cell = ws.cell(row=ws.max_row, column=4)
-            cell.fill = PatternFill('solid', fgColor=fillbg)
-            cell.font = Font(color=fill, bold=True)
+            # Colour the three membership columns (In PDF? / Offshore / Onshore).
+            for col_idx in (4, 5, 6):
+                status = ws.cell(row=ws.max_row, column=col_idx).value
+                yes = status == 'YES'
+                ws.cell(row=ws.max_row, column=col_idx).fill = PatternFill(
+                    'solid', fgColor='C6EFCE' if yes else 'FFC7CE')
+                ws.cell(row=ws.max_row, column=col_idx).font = Font(
+                    color='006100' if yes else '9C0006', bold=True)
         widths = [16, 30, 9, 13, 16, 16, 22, 70]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
@@ -161,13 +224,15 @@ def main():
     isins = load_isins()
     print(f'Checking {len(isins)} ISIN(s)...')
     data = build_data()
-    rows = [assess(i, data) for i in isins]
+    pub = build_published_sets(data)
+    rows = [assess(i, data, pub) for i in isins]
     path = write_xlsx(rows)
     print('\nDone. Answers written to:')
     print('   ' + path)
-    print('\nQuick summary:')
+    print('\nQuick summary (ISIN | PDF | Offshore | Onshore | reason):')
     for r in rows:
-        print(f"   {r['ISIN']:<14} {r['On the list?']:<4} {r['Reason']}")
+        print(f"   {r['ISIN']:<14} PDF={r['In PDF?']:<3} Off={r['Offshore Excel?']:<3} "
+              f"On={r['Onshore Excel?']:<3} {r['Reason']}")
 
 
 if __name__ == '__main__':
