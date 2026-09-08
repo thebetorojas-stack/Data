@@ -96,6 +96,7 @@ COUNTRY_REGION: Dict[str, str] = {
     "Ethiopia": "Africa", "Gabon": "Africa", "Ghana": "Africa",
     "Kenya": "Africa", "Morocco": "Africa", "Mozambique": "Africa",
     "Namibia": "Africa", "Nigeria": "Africa", "Republic of Congo": "Africa",
+    "Democratic Republic of Congo": "Africa",
     "Rwanda": "Africa", "Senegal": "Africa", "South Africa": "Africa",
     "Tanzania": "Africa", "Tunisia": "Africa", "Zambia": "Africa",
     # GCC / Mideast
@@ -205,10 +206,111 @@ METRICS = {
     "tret":   "Cum Tot Ret Idx",
 }
 
+# ---------------------------------------------------------------------------
+# HOW THE INDEX- AND REGION-LEVEL SPREAD IS AGGREGATED
+# ---------------------------------------------------------------------------
+# JPM's aggregate rows ("EMBI Global", "Latin", "Africa", ...) in the snapshot
+# and regional exports publish a DURATION-WEIGHTED spread — the column is
+# literally named "Dur Wgt STW (Trsy)". Duration weighting systematically
+# understates the index spread relative to the market-value-weighted number
+# the index is normally quoted on, because the widest credits are also the
+# shortest-duration ones (defaulted and near-default sovereigns carry spread
+# durations of ~1-1.5y against 14-17y for the long IG curve names). On the
+# 2026-09-03 file the published aggregate is 188bp against 284bp cap-weighted
+# off the very same country rows — a 96bp gap that is pure weighting, not
+# pricing.
+#
+#   "jpm"  – trust JPM's published aggregate row as-is (duration-weighted).
+#            DEFAULT: Alberto's reference EMBI Global spread of 218.42bp on
+#            2026-09-03 reconciles to JPM's duration weighting, NOT to a
+#            cap-weighted rebuild (which lands at 284bp). The weighting is
+#            right; it is the spread BASIS that is off. See SPREAD_ANCHOR_BPS.
+#   "cap"  – recompute index/region spread as a market-cap-weighted average of
+#            the per-country spreads.
+SPREAD_AGGREGATION = "jpm"
+
+# ---------------------------------------------------------------------------
+# SPREAD BASIS CALIBRATION  (the stripped-spread proxy)
+# ---------------------------------------------------------------------------
+# No JPM file we receive carries a stripped / sovereign spread column. What we
+# get is STW (Trsy) — spread to worst against the Treasury PAR curve — and
+# Z Spread to Worst, off the Treasury ZERO curve. The published stripped
+# spread sits between the two: on 2026-09-03 the index printed STW 188 and
+# Z 238 against a reference stripped spread of 218.42.
+#
+# So we interpolate:   spread* = STW + theta * (Z - STW)
+#
+# theta is not a fudge factor pulled from the air — it is SOLVED each run from
+# the index row against SPREAD_ANCHOR_BPS, then applied unchanged to every
+# country and region. Set SPREAD_ANCHOR_BPS to the published EMBI Global
+# stripped spread for the snapshot date and the whole surface reprices off it.
+#
+# Set to None to disable and publish raw STW (Trsy).
+#
+# CAVEAT: theta is calibrated on ONE date. It is stable only while the shape
+# of the Treasury curve is stable — a steepening moves the par/zero wedge and
+# theta with it. Re-anchor every month; if theta starts drifting outside
+# roughly 0.5-0.7, stop interpolating and get the real series from JPM.
+SPREAD_ANCHOR_BPS: Optional[float] = 218.42
+SPREAD_ANCHOR_DATE = "2026-09-03"
+
+# How the HISTORY (the JPM returns file) is put on the same basis. Without
+# this the workbook steps ~30bp on the date where returns-file history meets
+# snapshot-derived points — a level break that is not a market move and that
+# the Forecast reads as volatility.
+#
+#   "carry"  – DEFAULT, and the only mode that matters given the JPM pull we
+#              actually receive. Each entity's own par/zero wedge,
+#              theta * (Z - STW), is read off EVERY archived snapshot, giving a
+#              wedge TIME SERIES per entity. A returns date between two
+#              snapshots gets the linear interpolation of the two; a date
+#              outside the archive gets the nearest one. Entities with no
+#              snapshot row (the rating buckets) fall back to the index wedge.
+#
+#              This is why the snapshot archive matters here: with one snapshot
+#              the wedge is a flat constant carried back over all history; with
+#              twelve it tracks the Treasury curve month by month on its own.
+#              The estimate improves every month you run the script, using only
+#              files you already get.
+#   "exact"  – if a returns file ever arrives carrying a Z-spread series, use
+#              that date's own wedge directly. Falls back to "carry" per
+#              series. Left in place in case the JPM template ever changes;
+#              it is not currently expected to fire.
+#   "off"    – leave history on raw STW and accept the step.
+#
+# NOTE ON THE FORECAST: a constant additive offset leaves sigma untouched
+# (var(X + c) = var(X)), so re-basing this way does NOT contaminate the
+# vol calibration. A multiplicative rescale would have inflated sigma by the
+# ratio (~16%) — which is why this is additive.
+#
+# WHAT "carry" ASSUMES: that between (and beyond) snapshot dates the wedge
+# moves linearly. Inside the archived window that is a mild assumption. BEFORE
+# the earliest archived snapshot it degenerates to a flat carry, so levels
+# there are only as good as that one wedge — the further back, the softer the
+# number. Month-on-month CHANGES are unaffected throughout.
+RETURNS_BASIS_MODE = "carry"
+
+# Sovereigns in default / non-accrual. Their quoted spread is a mechanical
+# artefact of a yield-to-worst calculation on a bond that is not paying, so
+# whether they belong in a headline index spread is a judgement call, not a
+# data question. Set to True to strike them from the aggregate.
+EXCLUDE_DEFAULTED_FROM_AGGREGATE = False
+DEFAULTED_COUNTRIES = {"Venezuela", "Lebanon", "Ethiopia"}
+
 # Accepted spellings for the spread metric, normalized to METRICS["spread"].
 # The returns-file column header pattern is "EM Debt Indices | <Entity> | <Metric>",
 # but JPM (and the user's own renames) ship the spread metric under any of these
 # spellings depending on which DataQuery template the file came from.
+ZSPREAD_METRIC = "Z Spread to Worst"
+ZSPREAD_METRIC_ALIASES: Dict[str, str] = {
+    "z spread to worst":       ZSPREAD_METRIC,
+    "z- spread to wrst":       ZSPREAD_METRIC,
+    "z spread to wrst":        ZSPREAD_METRIC,
+    "dur wgt z- spread to wrst": ZSPREAD_METRIC,
+    "z spread":                ZSPREAD_METRIC,
+    "zspread":                 ZSPREAD_METRIC,
+}
+
 SPREAD_METRIC_ALIASES: Dict[str, str] = {
     "stw (trsy)":          "STW (Trsy)",
     "stw(trsy)":           "STW (Trsy)",
@@ -233,9 +335,26 @@ NAME_ALIASES: Dict[str, str] = {
 }
 
 
+_NAME_LOOKUP_CI: Dict[str, str] = {}
+
+
 def normalize_name(name: str) -> str:
     name = (name or "").strip().replace("&amp;", "&").replace("&#38;", "&")
-    return NAME_ALIASES.get(name, name)
+    if name in NAME_ALIASES:
+        return NAME_ALIASES[name]
+    if name in COUNTRY_REGION:
+        return name
+    # The JPM "regional" export ships some instrument names in ALL CAPS
+    # ('MONTENEGRO', 'REPUBLIC OF CONGO', 'DEMOCRATIC REPUBLIC OF CONGO')
+    # while the classic snapshot uses title case. Fall back to a
+    # case-insensitive match before giving up and treating the row as an
+    # unknown entity (which would silently drop it from every rollup).
+    if not _NAME_LOOKUP_CI:
+        for k, v in NAME_ALIASES.items():
+            _NAME_LOOKUP_CI[k.lower()] = v
+        for k in COUNTRY_REGION:
+            _NAME_LOOKUP_CI.setdefault(k.lower(), k)
+    return _NAME_LOOKUP_CI.get(name.lower(), name)
 
 
 # ============================================================================
@@ -395,6 +514,10 @@ def load_returns(path: Path) -> Tuple[List[datetime], Dict[Tuple[str, str], List
         metric_key = metric.strip().lower()
         if metric_key in SPREAD_METRIC_ALIASES:
             metric = SPREAD_METRIC_ALIASES[metric_key]
+        elif metric_key in ZSPREAD_METRIC_ALIASES:
+            # Kept (not discarded as in earlier builds) because the Z series is
+            # what lets history be put on the stripped basis exactly.
+            metric = ZSPREAD_METRIC_ALIASES[metric_key]
         columns.append((normalize_name(parts[1]), metric))
 
     parsed: List[Tuple[datetime, List[Optional[float]]]] = []
@@ -558,6 +681,7 @@ def merge_snapshots(file_results: List[Tuple[Optional[datetime], Dict[str, Dict[
 def snapshot_to_returns(
     snap_date: datetime,
     snap_data: Dict[str, Dict[str, Any]],
+    theta: Optional[float] = None,
 ) -> Tuple[List[datetime], Dict[Tuple[str, str], List[Optional[float]]]]:
     """Convert one snapshot into a synthetic (dates, series) tuple matching the
     shape of a returns file. This lets a snapshot be merged into the same time
@@ -599,6 +723,29 @@ def snapshot_to_returns(
             except ValueError:
                 continue
             series[(returns_ent, metric)] = [v]
+
+    # Replace JPM's duration-weighted aggregate spread with a cap-weighted
+    # rebuild off the country rows. See SPREAD_AGGREGATION at the top.
+    if SPREAD_AGGREGATION == "cap":
+        for ent, val in cap_weighted_aggregates(snap_data).items():
+            series[(ent, METRICS["spread"])] = [val]
+
+    # Re-base every spread from STW onto the stripped-spread proxy, using a
+    # single theta solved off the index row. See SPREAD_ANCHOR_BPS.
+    if theta is None:
+        theta = solve_spread_theta(snap_data)
+    if theta is not None:
+        for ent, data in snap_data.items():
+            if ent in _SNAPSHOT_ENTITY_TO_RETURNS:
+                returns_ent = _SNAPSHOT_ENTITY_TO_RETURNS[ent]
+            elif isinstance(ent, str) and not ent.startswith(("REGION:", "INDEX:", "AGG:")):
+                returns_ent = ent
+            else:
+                continue
+            val = apply_spread_basis(data, theta)
+            if val is not None:
+                series[(returns_ent, METRICS["spread"])] = [val]
+
     return [snap_date], series
 
 
@@ -611,14 +758,265 @@ _SNAPSHOT_ENTITY_TO_RETURNS: Dict[str, str] = {
     "REGION:GCC":    "Mideast Region",
 }
 
+# Ordered: the "Dur Wgt *" spellings used by the JPM *regional* export come
+# first, the classic snapshot spellings second, so that when a file carries
+# both the plain column wins.
 _SNAPSHOT_FIELD_TO_METRIC: Dict[str, str] = {
-    "Index Level":       "Cum Tot Ret Idx",
-    "Yield to Worst":    "Yld to Maturity",
+    "Index Level":               "Cum Tot Ret Idx",
+    "Dur Wgt Yield Wrst":        "Yld to Maturity",
+    "Dur Wgt STW (Trsy)":        "STW (Trsy)",
+    "Yield to Worst":            "Yld to Maturity",
     # The snapshot CSV always carries an "STW (Trsy)" column AND a
     # "Z Spread to Worst" column. We feed the time series exclusively from
     # STW (Trsy) — that's the spread Alberto trades off.
-    "STW (Trsy)":        "STW (Trsy)",
+    "STW (Trsy)":                "STW (Trsy)",
 }
+
+# Every spelling under which a per-country spread can arrive, best first.
+_SPREAD_SNAPSHOT_FIELDS = ("Dur Wgt STW (Trsy)", "STW (Trsy)")
+_ZSPREAD_SNAPSHOT_FIELDS = ("Dur Wgt Z- Spread to Wrst", "Z Spread to Worst",
+                            "Z- Spread to Wrst", "Z Spread")
+
+
+def _snapshot_spread(row: Dict[str, Any]) -> Optional[float]:
+    """Pull the per-country spread out of a snapshot row, whichever column
+    spelling this particular JPM export happens to use."""
+    for fld in _SPREAD_SNAPSHOT_FIELDS:
+        raw = (row.get(fld) or "").strip() if row else ""
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def _snapshot_zspread(row: Dict[str, Any]) -> Optional[float]:
+    """Per-country Z-spread (Treasury zero curve), whichever spelling arrives."""
+    for fld in _ZSPREAD_SNAPSHOT_FIELDS:
+        raw = (row.get(fld) or "").strip() if row else ""
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def solve_spread_theta(snap_data: Dict[str, Dict[str, Any]]) -> Optional[float]:
+    """Solve the STW->Z interpolation weight from the index row and the
+    published stripped-spread anchor:  theta = (anchor - STW) / (Z - STW).
+
+    Returns None when there is no anchor, no index row, or the two measures
+    are too close together for the solve to mean anything.
+    """
+    if SPREAD_ANCHOR_BPS is None:
+        return None
+    idx = snap_data.get("INDEX:EMBI")
+    if not idx:
+        return None
+    s = _snapshot_spread(idx)
+    z = _snapshot_zspread(idx)
+    if s is None or z is None or abs(z - s) < 1.0:
+        return None
+    return (SPREAD_ANCHOR_BPS - s) / (z - s)
+
+
+def solve_anchor_theta(
+    snap_history: List[Tuple[datetime, Dict[str, Dict[str, Any]]]],
+    snap_data: Dict[str, Dict[str, Any]],
+) -> Optional[float]:
+    """Solve theta ONCE, on the snapshot matching SPREAD_ANCHOR_DATE.
+
+    This must not be re-solved per snapshot. The anchor is a single observed
+    stripped spread on a single date; re-solving it against every archived
+    snapshot would force EVERY snapshot date to print that same anchor value
+    and flatten the index spread into a constant. theta is a basis-conversion
+    constant; what varies month to month is each snapshot's own (Z - STW).
+    """
+    if SPREAD_ANCHOR_BPS is None:
+        return None
+    for d, data in snap_history:
+        if d is not None and f"{d:%Y-%m-%d}" == SPREAD_ANCHOR_DATE:
+            return solve_spread_theta(data)
+    return solve_spread_theta(snap_data)   # anchor date not archived — use latest
+
+
+def apply_spread_basis(row: Dict[str, Any], theta: Optional[float]) -> Optional[float]:
+    """Stripped-spread proxy for one row: STW + theta * (Z - STW).
+
+    Where Z < STW the two measures have inverted — that only happens on
+    defaulted paper whose yield-to-worst is an artefact (Venezuela on
+    2026-09-03: STW 4205 vs Z 3928). Interpolating there would drag the
+    number the wrong way, so we leave those rows on raw STW.
+    """
+    s = _snapshot_spread(row)
+    if s is None or theta is None:
+        return s
+    z = _snapshot_zspread(row)
+    if z is None or z < s:
+        return s
+    return s + theta * (z - s)
+
+
+def cap_weighted_aggregates(snap_data: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    """Rebuild the index and regional spread as a MARKET-CAP-weighted average
+    of the per-country spreads in the snapshot, replacing JPM's published
+    duration-weighted aggregate rows.
+
+    Countries quoting a negative spread are always dropped: a negative STW is
+    a broken yield-to-worst on a defaulted bond, not a market price. Rows that
+    are not in COUNTRY_REGION are skipped too, which also keeps the regional
+    export's extra 'By Credit Bucket' / 'By Sov/Quasi' sections (Investment
+    Grade, Sovereign, BB, ...) out of the average — they would otherwise be
+    double-counted as if they were countries.
+    """
+    buckets: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])
+    for ent, row in snap_data.items():
+        if not isinstance(ent, str) or ent.startswith(("REGION:", "INDEX:", "AGG:")):
+            continue
+        region = COUNTRY_REGION.get(ent)
+        if region is None:
+            continue
+        if EXCLUDE_DEFAULTED_FROM_AGGREGATE and ent in DEFAULTED_COUNTRIES:
+            continue
+        spread = _snapshot_spread(row)
+        if spread is None or spread < 0:
+            continue
+        try:
+            w = float((row.get("Mkt Cap %") or "").strip())
+        except ValueError:
+            continue
+        if w <= 0:
+            continue
+        for key in (region, "__INDEX__"):
+            b = buckets[key]
+            b[0] += w * spread
+            b[1] += w
+
+    out: Dict[str, float] = {}
+    for key, (num, den) in buckets.items():
+        if den <= 0:
+            continue
+        name = INDEX_NAME if key == "__INDEX__" else REGION_AGGREGATE.get(key)
+        if name:
+            out[name] = num / den
+    return out
+
+
+def stripped_offsets(snap_data: Dict[str, Dict[str, Any]],
+                     theta: Optional[float]) -> Dict[str, float]:
+    """Each entity's own STW->stripped offset, theta * (Z - STW), read off the
+    latest snapshot cross-section. Keyed by the entity's returns-file name."""
+    offsets: Dict[str, float] = {}
+    if theta is None:
+        return offsets
+    for ent, row in snap_data.items():
+        if ent in _SNAPSHOT_ENTITY_TO_RETURNS:
+            name = _SNAPSHOT_ENTITY_TO_RETURNS[ent]
+        elif isinstance(ent, str) and not ent.startswith(("REGION:", "INDEX:", "AGG:")):
+            name = ent
+        else:
+            continue
+        s = _snapshot_spread(row)
+        z = _snapshot_zspread(row)
+        if s is None or z is None or z < s:
+            continue  # inverted = defaulted paper; leave it on raw STW
+        offsets[name] = theta * (z - s)
+    return offsets
+
+
+# NOTE: stripped_offsets / stripped_offsets_history take the ONE theta solved
+# at the anchor date (solve_anchor_theta) and apply it unchanged to every
+# snapshot. Each snapshot then contributes its own observed (Z - STW), so the
+# wedge moves through time while the basis conversion stays fixed.
+def stripped_offsets_history(
+    snap_history: List[Tuple[datetime, Dict[str, Dict[str, Any]]]],
+    theta: Optional[float],
+) -> Dict[str, List[Tuple[datetime, float]]]:
+    """Per-entity wedge TIME SERIES, one point per archived snapshot.
+
+    Every snapshot carries both STW and Z for every country, so the archive is
+    itself a record of how each credit's par/zero wedge moved. With one
+    snapshot this is a single point (a flat carry); it densifies on its own
+    every month the script is run.
+    """
+    out: Dict[str, List[Tuple[datetime, float]]] = defaultdict(list)
+    for s_date, s_data in snap_history:
+        if s_date is None:
+            continue
+        for ent, off in stripped_offsets(s_data, theta).items():
+            out[ent].append((s_date, off))
+    for ent in out:
+        out[ent].sort(key=lambda t: t[0])
+    return out
+
+
+def _offset_at(points: List[Tuple[datetime, float]], when: datetime) -> Optional[float]:
+    """Wedge for a date: linear between bracketing snapshots, nearest outside."""
+    if not points:
+        return None
+    if when <= points[0][0]:
+        return points[0][1]
+    if when >= points[-1][0]:
+        return points[-1][1]
+    for i in range(1, len(points)):
+        d0, o0 = points[i - 1]
+        d1, o1 = points[i]
+        if d0 <= when <= d1:
+            span = (d1 - d0).days
+            if span <= 0:
+                return o1
+            return o0 + (o1 - o0) * ((when - d0).days / span)
+    return points[-1][1]
+
+
+def rebase_returns_to_stripped(
+    dates: List[datetime],
+    series: Dict[Tuple[str, str], List[Optional[float]]],
+    snap_history: List[Tuple[datetime, Dict[str, Dict[str, Any]]]],
+    theta: Optional[float],
+) -> Tuple[int, int, Optional[float]]:
+    """Put the returns-file spread history on the stripped basis, in place.
+
+    Returns (n_exact, n_carried, index_offset_at_latest) for the run log.
+    """
+    if theta is None or RETURNS_BASIS_MODE == "off":
+        return 0, 0, None
+    spread = METRICS["spread"]
+    hist = stripped_offsets_history(snap_history, theta)
+    idx_pts = hist.get(INDEX_NAME, [])
+    n_exact = n_carry = 0
+
+    for (ent, metric) in [k for k in series if k[1] == spread]:
+        vals = series[(ent, metric)]
+        zvals = series.get((ent, ZSPREAD_METRIC)) if RETURNS_BASIS_MODE == "exact" else None
+        pts = hist.get(ent) or idx_pts
+        if not pts:
+            continue
+        out: List[Optional[float]] = []
+        used_exact = used_carry = False
+        for i, v in enumerate(vals):
+            if v is None:
+                out.append(None)
+                continue
+            z = zvals[i] if zvals is not None and i < len(zvals) else None
+            if z is not None and z >= v:
+                out.append(v + theta * (z - v))       # this date's own wedge
+                used_exact = True
+                continue
+            off = _offset_at(pts, dates[i]) if i < len(dates) else pts[-1][1]
+            if off is None:
+                out.append(v)
+            else:
+                out.append(v + off)                   # wedge interpolated from archive
+                used_carry = True
+        series[(ent, metric)] = out
+        if used_exact:
+            n_exact += 1
+        elif used_carry:
+            n_carry += 1
+    return n_exact, n_carry, (idx_pts[-1][1] if idx_pts else None)
 
 
 def archive_snapshots(input_paths: List[Path], project_dir: Path) -> Tuple[Path, List[Tuple[str, str]]]:
@@ -757,6 +1155,8 @@ class Builder:
             for ent, data in snap_data.items():
                 if not isinstance(ent, str) or ent.startswith(("REGION:", "INDEX:", "AGG:")):
                     continue
+                if ent not in COUNTRY_REGION:
+                    continue  # 'Investment Grade', 'Sovereign', 'BB', ... are not countries
                 raw = (data.get("Mkt Cap %") or "").strip()
                 if not raw:
                     continue
@@ -1832,10 +2232,10 @@ class Builder:
             ("S&P", 8, "Average S&P Rating"),
             ("Moody's", 9, "Average Moody Rating"),
             ("Fitch", 8, "Average Fitch Rating"),
-            ("YTW", 10, "Yield to Worst"),
-            ("STW (Trsy)", 12, "STW (Trsy)"),
+            ("YTW", 10, ("Yield to Worst", "Dur Wgt Yield Wrst")),
+            ("STW (Trsy)", 12, ("STW (Trsy)", "Dur Wgt STW (Trsy)")),
             ("Spread Dur", 11, "Spread Duration"),
-            ("Avg Life", 10, "Avr. Life"),
+            ("Avg Life", 10, ("Avr. Life", "Weighted Avg Avg Life Wrst")),
             ("MTD chg %", 11, "MTD Change (%)"),
             ("YTD chg %", 11, "YTD Change (%)"),
             ("# Issues", 10, "No. of Issues"),
@@ -1872,7 +2272,15 @@ class Builder:
         for i, (h, _, key) in enumerate(cols, start=1):
             if key in ("region", "country"):
                 continue  # already written by caller
-            val = (snap.get(key) or "").strip() if snap else ""
+            # A key may be a tuple of accepted column spellings (the JPM
+            # regional export renames several snapshot columns).
+            candidates = key if isinstance(key, tuple) else (key,)
+            val = ""
+            for cand in candidates:
+                val = (snap.get(cand) or "").strip() if snap else ""
+                if val:
+                    break
+            key = candidates[0]
             cell = ws.cell(row=row, column=i)
             cell.border = THIN_BORDER
             self._font(cell)
@@ -3326,8 +3734,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Spreads / Yields / TR_YTD tabs grow a new column every time the user
     # drops a fresh snapshot in the folder.
     synthetic_returns: List[Tuple[List[datetime], Dict[Tuple[str, str], List[Optional[float]]]]] = []
+    anchor_theta = solve_anchor_theta(snap_history, snap_data)
+    if anchor_theta is not None:
+        anchored = any(d is not None and f"{d:%Y-%m-%d}" == SPREAD_ANCHOR_DATE
+                       for d, _ in snap_history)
+        if not anchored:
+            print(f"  WARNING: anchor date {SPREAD_ANCHOR_DATE} is not in the snapshot "
+                  f"archive — theta was solved off the latest snapshot instead. "
+                  f"Levels will be off unless SPREAD_ANCHOR_BPS matches that date.",
+                  file=sys.stderr)
     for s_date, s_data in snap_history:
-        syn_dates, syn_series = snapshot_to_returns(s_date, s_data)
+        syn_dates, syn_series = snapshot_to_returns(s_date, s_data, anchor_theta)
         if syn_series:
             synthetic_returns.append((syn_dates, syn_series))
     if synthetic_returns:
@@ -3342,6 +3759,32 @@ def main(argv: Optional[List[str]] = None) -> int:
               "contain dates from the snapshots you've accumulated. Add a "
               "Query 3 returns CSV to the folder for full historical context.",
               file=sys.stderr)
+
+    # Put the returns-file HISTORY on the stripped basis BEFORE it is merged
+    # with the snapshot-derived rows (which snapshot_to_returns has already
+    # re-based). Doing it in this order avoids double-counting the offset on
+    # dates that both sources cover.
+    if returns_results:
+        hist_dates, hist_series = merge_returns(returns_results)
+        theta_hist = anchor_theta
+        n_exact, n_carry, idx_off = rebase_returns_to_stripped(
+            hist_dates, hist_series, snap_history, theta_hist)
+        if theta_hist is not None:
+            print(f"  Spread basis: theta={theta_hist:.4f} solved against "
+                  f"{SPREAD_ANCHOR_BPS}bp anchor ({SPREAD_ANCHOR_DATE})")
+            if n_exact or n_carry:
+                print(f"    history re-based -> {n_exact} series exact (Z in file), "
+                      f"{n_carry} series carried"
+                      + (f" (index offset {idx_off:+.1f}bp)" if idx_off is not None else ""))
+            n_snaps = len([s for s in snap_history if s[0] is not None])
+            if n_snaps <= 1:
+                print("    wedge from 1 snapshot — flat carry over all history. "
+                      "Each further snapshot you archive lets it track the curve.")
+            else:
+                span = f"{min(s[0] for s in snap_history):%Y-%m-%d}..{max(s[0] for s in snap_history):%Y-%m-%d}"
+                print(f"    wedge interpolated from {n_snaps} archived snapshots ({span}); "
+                      "flat carry before the earliest.")
+        returns_results = [(hist_dates, hist_series)]
 
     dates, series = merge_returns(synthetic_returns + returns_results)
     weight_dates, weight_series = merge_weights_history(weights_results)
