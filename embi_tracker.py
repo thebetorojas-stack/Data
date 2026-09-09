@@ -740,9 +740,10 @@ class Dashboard:
         ws.sheet_view.showGridLines = False
         ws["A1"] = f"Year to date {self.year} — {self.d0} to {self.d1}"
         F(ws["A1"], size=14, bold=True, color=C_HDR)
-        ws["A2"] = ("Total return split into what the spread move was worth, what the Treasury "
-                    "move was worth, and the remainder — realised coupon, roll, rebalancing and "
-                    "defaults. The three legs add to the total by construction.")
+        ws["A2"] = ("Total return is (end / start - 1) on the index's own total-return series. "
+                    "Spread and Treasury moves are shown in basis points. For a return "
+                    "attribution use JPM's published legs below — ours has been removed because a "
+                    "duration split misbehaves badly on this index.")
         F(ws["A2"], italic=True, color=C_NOTE)
         ws.column_dimensions["A"].width = 34
         for c in "BCDEFGH":
@@ -756,13 +757,6 @@ class Dashboard:
             ("Spread move (bp)", a.get("spread_bp"), "+0;-0",
              f"{self.p.get(self.d0, INDEX, M_STW):.0f} -> {self.spread:.0f}"),
             ("Underlying Treasury move (bp)", a.get("ust_bp"), "+0;-0", "yield less spread"),
-            ("", None, "", ""),
-            ("  worth of the spread move", a.get("spread_leg"), "+0.00;-0.00",
-             f"= -{self.D:.2f} x spread change"),
-            ("  worth of the rate move", a.get("rate_leg"), "+0.00;-0.00",
-             f"= -{self.D:.2f} x Treasury change"),
-            ("  carry, roll and residual", a.get("residual"), "+0.00;-0.00",
-             "the remainder, not an error"),
         ]:
             if not lbl:
                 r += 1
@@ -829,17 +823,19 @@ class Dashboard:
         ws.sheet_view.showGridLines = False
         ws["A1"] = f"{title} — YTD {self.year} ({self.d0} to {self.d1})"
         F(ws["A1"], size=14, bold=True, color=C_HDR)
-        ws["A2"] = ("Total returns are taken straight from each sub-index's own total-return "
-                    "index — nothing derived. The decomposition columns on the right are a "
-                    "duration approximation and are indicative only; JPM's own legs are just as "
-                    "extreme (Middle East YTD: spread +10.5%, Treasury -9.5%, netting +0.05%).")
+        ws["A2"] = ("Every return here is (end / start - 1) on that sub-index's own total-return "
+                    "index. Nothing is derived from duration. Spread and Treasury moves are shown "
+                    "in basis points beside them; the duration decomposition has been removed "
+                    "because it produced figures like a +52% spread contribution for Credit C "
+                    "against an actual +17.9%.")
         F(ws["A2"], italic=True, color=C_NOTE)
-        cols = [("", 30), ("Weight %", 10), ("Spread now", 11), ("Yield %", 9),
-                ("Return 1m %", 12), ("Return 3m %", 12), ("Return YTD %", 13),
-                ("Return 12m %", 13),
-                ("Spread 1m bp", 13), ("Spread YTD bp", 13), ("Treasury YTD bp", 14),
-                ("Duration", 10),
-                ("YTD: spread leg", 15), ("YTD: rate leg", 14), ("YTD: carry", 12),
+        d_1m, d_3m, d_12m = self._back(1), self._back(3), self._back(12)
+        cols = [("", 30), ("Weight %", 10), ("Spread now", 11), ("Yield %", 9), ("Duration", 10),
+                (f"Return 1m %\n{d_1m or '—'}", 13),
+                (f"Return 3m %\n{d_3m or '—'}", 13),
+                (f"Return YTD %\n{self.d0}", 13),
+                (f"Return 12m %\n{d_12m or '—'}", 13),
+                ("Spread 1m bp", 12), ("Spread YTD bp", 13), ("Treasury YTD bp", 14),
                 ("read with care", 34)]
         hr = 4
         for i, (h, w) in enumerate(cols, start=1):
@@ -855,41 +851,35 @@ class Dashboard:
                 continue          # not in the index at the latest date
             rows.append((w if sort_by_weight else 0, e, at, w))
         rows.sort(key=lambda t: -t[0])
-        d_1m, d_3m, d_12m = self._back(1), self._back(3), self._back(12)
+        ws.row_dimensions[hr].height = 30
         r = hr + 1
         for _k, e, at, w in rows:
             L(ws.cell(row=r, column=1), e, bold=False)
             V(ws.cell(row=r, column=2), w, fmt="0.00", color=C_HARD)
             V(ws.cell(row=r, column=3), self.p.get(self.d1, e, M_STW), fmt="0", color=C_HARD)
             V(ws.cell(row=r, column=4), self.p.get(self.d1, e, M_YLD), fmt="0.00", color=C_HARD)
-            # total return, straight off the sub-index return series
-            for k, dd in enumerate([d_1m, d_3m, self.d0, d_12m], start=5):
+            V(ws.cell(row=r, column=5), at.get("dur"), fmt="0.00")
+            # total return = (end / start - 1) on this sub-index's own return series
+            for k, dd in enumerate([d_1m, d_3m, self.d0, d_12m], start=6):
                 val = self._chg(e, M_TRI, dd, self.d1)
                 cell = V(ws.cell(row=r, column=k), val, fmt="+0.00;-0.00",
-                         bold=(k == 7), color=C_HARD)
+                         bold=(k == 8), color=C_HARD)
                 if val is not None:
                     cell.fill = PatternFill("solid", fgColor=C_GOOD if val >= 0 else C_BAD)
-            V(ws.cell(row=r, column=9), self._chg(e, M_STW, d_1m, self.d1), fmt="+0;-0")
-            V(ws.cell(row=r, column=10), at.get("spread_bp"), fmt="+0;-0")
-            V(ws.cell(row=r, column=11), at.get("ust_bp"), fmt="+0;-0")
-            V(ws.cell(row=r, column=12), at.get("dur"), fmt="0.00")
-            V(ws.cell(row=r, column=13), at.get("spread_leg"), fmt="+0.00;-0.00", color=C_NOTE)
-            V(ws.cell(row=r, column=14), at.get("rate_leg"), fmt="+0.00;-0.00", color=C_NOTE)
-            V(ws.cell(row=r, column=15), at.get("residual"), fmt="+0.00;-0.00", color=C_NOTE)
+            V(ws.cell(row=r, column=10), self._chg(e, M_STW, d_1m, self.d1), fmt="+0;-0")
+            V(ws.cell(row=r, column=11), at.get("spread_bp"), fmt="+0;-0")
+            V(ws.cell(row=r, column=12), at.get("ust_bp"), fmt="+0;-0")
             flag = at.get("flag") or ""
-            c = V(ws.cell(row=r, column=16), flag, fmt="General", color=C_NOTE)
+            c = V(ws.cell(row=r, column=13), flag, fmt="General", color=C_NOTE)
             c.alignment = Alignment(horizontal="left")
             F(c, italic=True, color=C_NOTE)
-            if flag:
-                for cc in range(13, 16):
-                    ws.cell(row=r, column=cc).fill = PatternFill("solid", fgColor=C_BAD)
             r += 1
         ws.freeze_panes = "B5"
         r += 1
         ws.cell(row=r, column=1, value=(
-            "Columns E-H are the numbers to use: actual total return over each window, from the "
-            "sub-index return series. Columns M-O are a duration decomposition and will not tie "
-            "to anyone else's attribution."))
+            "Each return column header carries the date it is measured from, so there is never a "
+            "question of which window a number belongs to. Returns are from the total-return "
+            "sub-indices; spread and Treasury moves are chain-linked across basis breaks."))
         F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
 
     # ---------- month-end sampling ----------
@@ -1403,7 +1393,7 @@ def monthly_highlights(panel: Panel, d0: Optional[str], d1: str,
     sp = panel.get(d1, INDEX, M_STW)
     if tot is not None:
         word = "returned" if tot >= 0 else "lost"
-        out.append(f"EMBIGD {word} {abs(tot):.2f}% on the month, with the index spread "
+        out.append(f"Over the past month EMBIGD {word} {abs(tot):.2f}%, with the index spread "
                    f"{'tighter' if (sb or 0) < 0 else 'wider'} by {abs(sb or 0):.0f}bp to {sp:.0f}bp.")
     sb2 = idx.get("spread_bp")
     ub2 = idx.get("ust_bp")
@@ -1593,28 +1583,30 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         txt(s1, x, 2.4, 2.8, 0.7, v, 32, True, PPT_RED if neg else PPT_BLUE,
             "Arial", PP_ALIGN.CENTER)
         txt(s1, x + 0.15, 3.15, 2.5, 0.6, l, 11, False, PPT_MUTE, "Arial", PP_ALIGN.CENTER)
-    txt(s1, 0.7, 4.3, 11.3, 0.3, "What drove the month", 13, True, PPT_BLUE)
-    q = dash._chg(INDEX, M_TRI, dash._back(3), d1)
-    y1 = dash._chg(INDEX, M_TRI, dash._back(12), d1)
-    if idx:
-        bullets(s1, 0.7, 4.65, 11.9, 1.0, [
-            f"Total return: {idx.get('total', 0):+.2f}% past month, "
-            + (f"{q:+.2f}% over three months, " if q is not None else "")
-            + f"{ytd.get('total', 0):+.2f}% year to date"
-            + (f", {y1:+.2f}% over twelve." if y1 is not None else "."),
-            f"Spreads {idx.get('spread_bp', 0):+.0f}bp on the month and "
-            f"{ytd.get('spread_bp', 0):+.0f}bp year to date, against a move of "
-            f"{ytd.get('ust_bp', 0):+.0f}bp in the underlying Treasury.",
-        ], 13)
+    # One labelled column per period. A single sentence carrying four numbers
+    # invites the reader to attach the last one to the first label.
+    periods = [("Past month", d0), ("3 months", dash._back(3)),
+               (f"YTD {dash.year}", dash.d0), ("12 months", dash._back(12))]
+    hdr_row, ret_row, spr_row = ["Period"], ["Total return %"], ["Spread change bp"]
+    for lbl, dfrom in periods:
+        tr_ = dash._chg(INDEX, M_TRI, dfrom, d1)
+        sb_ = dash._chg(INDEX, M_STW, dfrom, d1)
+        hdr_row.append(lbl)
+        ret_row.append(f"{tr_:+.2f}" if tr_ is not None else "—")
+        spr_row.append(f"{sb_:+.0f}" if sb_ is not None else "—")
+    txt(s1, 0.7, 4.2, 11.9, 0.3, "EMBIGD total return, from the index's own return series",
+        13, True, PPT_BLUE)
+    table(s1, 0.7, 4.55, 9.6, [hdr_row, ret_row, spr_row],
+          [2.4, 1.8, 1.8, 1.8, 1.8], size=12)
     hist = [(d, panel.get(d, INDEX, M_STW)) for d in dash.month_ends(13)]
     hist = [(d, v_) for d, v_ in hist if v_ is not None]
     if len(hist) >= 4:
-        txt(s1, 0.7, 5.55, 11.9, 0.3, "Index spread, last twelve months (bp)", 13, True, PPT_BLUE)
+        txt(s1, 0.7, 5.75, 11.9, 0.3, "Index spread, last twelve months (bp)", 13, True, PPT_BLUE)
         cd2 = CategoryChartData()
         cd2.categories = [d[:7] for d, _ in hist]
         cd2.add_series("Spread", [v_ for _, v_ in hist])
-        gf2 = s1.shapes.add_chart(XL_CHART_TYPE.LINE, Inches(0.7), Inches(5.85),
-                                  Inches(11.9), Inches(1.0), cd2).chart
+        gf2 = s1.shapes.add_chart(XL_CHART_TYPE.LINE, Inches(0.7), Inches(6.05),
+                                  Inches(11.9), Inches(0.85), cd2).chart
         gf2.has_legend = False
         gf2.has_title = False
         ca2 = gf2.category_axis
@@ -1627,7 +1619,7 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         va2.tick_labels.font.color.rgb = rgb(PPT_MUTE)
         ln = gf2.plots[0].series[0].format.line
         ln.color.rgb = rgb(PPT_BLUE); ln.width = Pt(2)
-    txt(s1, 0.7, 6.95, 11.9, 0.3,
+    txt(s1, 0.7, 7.0, 11.9, 0.3,
         "Source: JPM EMBI Global Diversified. Spread changes chain-linked across basis breaks; "
         "the level series is shown as published.", 9, False, PPT_MUTE)
 
