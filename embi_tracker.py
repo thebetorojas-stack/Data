@@ -87,7 +87,34 @@ DEFAULT_IR_DURATION = 6.230
 # rate rise from an inflation shock).
 BETAS = {"ust10y_bp": 0.30, "dxy_pct": 6.0, "vix_pts": 4.0, "rating_notches": -50.0}
 CASH_RATE = 4.50           # the hurdle the call is judged against
-SENSITIVITY_UST = [-100, -75, -50, -25, 0, 25, 50, 75, 100]
+# Scenarios are expressed as LEVELS of the US 10-year, not as changes: nobody
+# forecasts "+25bp", they forecast "4.75%". Set the current level here; leave
+# it None and the script falls back to the Treasury implied by the index
+# itself (yield less spread), which sits at the index's ~11y point rather than
+# the 10y and is therefore only a stand-in. Set it properly for published work.
+UST10Y_NOW: Optional[float] = 4.80
+
+# TERM PREMIUM
+# ------------
+# The index is NOT priced off the 10y. Its spread is struck at each bond's own
+# maturity, and the cap-weighted average life is 10.2 years, so the Treasury it
+# is actually exposed to sits further out: yield 6.65% less spread 173bp puts
+# the anchor at 4.92% against a 10y of 4.80%. That 12bp is term premium for the
+# extra maturity, and it is about what the cross-sectional curve implies
+# (4.9bp per year of average life x ~1.2 years).
+#
+# The premium is computed each run, not hard-coded. What it buys is honesty on
+# the scenario slide: a 10y at 5.00% means an index anchor at 5.12%, and the
+# reader can see the two are different points on the curve.
+#
+# CURVE_BETA is how far the index's anchor moves for 1bp on the 10y. At 1.0 the
+# curve shifts in parallel and the term premium cancels out of every CHANGE, so
+# the returns are unaffected and the adjustment is presentational. Set it below
+# 1.0 for a flattening (the long end moves less than the 10y) or above for a
+# steepening. It cannot be estimated from these files - there is no 10y series
+# in them - so it stays at 1.0 until you feed one in.
+CURVE_BETA = 1.0
+SENSITIVITY_UST = [-100, -75, -50, -25, 0, 25, 50, 75, 100]   # kept for grid B
 SENSITIVITY_SPREADS = [125, 150, 175, 200, 225, 250, 275]
 
 # A duration approximation is a first-order expansion: it is accurate for small
@@ -157,10 +184,11 @@ SKIP_INSTRUMENTS = {"non latin", "sovereign", "quasi", "nr"}
 # ===========================================================================
 
 FN = "Arial"
-C_HDR, C_HDRFG = "1F4E78", "FFFFFF"
-C_BAND, C_GOOD, C_BAD = "D9E1F2", "E2EFDA", "FCE4E4"
-C_IN, C_BRD = "FFF2CC", "BFBFBF"
-C_HARD, C_TXT, C_NOTE = "0000FF", "000000", "7F7F7F"
+C_HDR, C_HDRFG = "002B5C", "FFFFFF"      # UBS-style deep blue header
+C_BAND = "DCE3EC"                         # pale blue section band
+C_GOOD, C_BAD = "EDF2F8", "FBE7E9"        # pale blue / pale red, no green
+C_IN, C_BRD = "E8EEF5", "BFBFBF"          # inputs shaded blue, not yellow
+C_HARD, C_TXT, C_NOTE = "0033A0", "000000", "6E6E6E"
 BRD = Border(*[Side(style="thin", color=C_BRD)] * 4)
 
 
@@ -614,6 +642,17 @@ def sigma_12m(panel: Panel, e: str = INDEX) -> Tuple[Optional[float], Optional[f
     return daily, direct, len(obs)
 
 
+def ust_levels(now: float, span: float = 1.0, step: float = 0.25) -> List[float]:
+    """Quarter-point levels either side of where the 10y is today."""
+    lo = math.floor((now - span) / step) * step
+    hi = math.ceil((now + span) / step) * step
+    out, x = [], lo
+    while x <= hi + 1e-9:
+        out.append(round(x, 4))
+        x += step
+    return out
+
+
 def total_return(yld: float, ir_dur: float, spr_dur: float,
                  d_ust_bp: float, spread_now: float, spread_fcst: float) -> float:
     return yld - ir_dur * (d_ust_bp / 100.0) - spr_dur * ((spread_fcst - spread_now) / 100.0)
@@ -639,6 +678,15 @@ class Dashboard:
         self.spread = panel.get(self.d1, INDEX, M_STW) or 0.0
         self.countries = [e for e in panel.entities()
                           if e != INDEX and e not in REGIONS and e not in RATINGS]
+        iu = implied_ust(panel, self.d1, INDEX)
+        self.ust_now = iu if iu is not None else 4.50      # the index's own anchor
+        self.ust_src = ("index anchor = yield less spread; the 10y is set in the script"
+                        if UST10Y_NOW is not None else
+                        "no 10y set — the index anchor is standing in for it")
+        # self.ust_now is the INDEX's own Treasury anchor. The 10y is separate.
+        self.ust10y = float(UST10Y_NOW) if UST10Y_NOW is not None else self.ust_now
+        self.term_premium = self.ust_now - self.ust10y
+        self.ust_grid = ust_levels(self.ust10y)
 
     # ---------- cover ----------
     def cover(self):
@@ -781,14 +829,18 @@ class Dashboard:
         ws.sheet_view.showGridLines = False
         ws["A1"] = f"{title} — YTD {self.year} ({self.d0} to {self.d1})"
         F(ws["A1"], size=14, bold=True, color=C_HDR)
-        ws["A2"] = ("Spread and rate legs are at published duration; 'carry & residual' is the "
-                    "remainder that makes the three add to the total. Shaded rows are flagged in "
-                    "the last column — the decomposition there is arithmetic, not analysis.")
+        ws["A2"] = ("Total returns are taken straight from each sub-index's own total-return "
+                    "index — nothing derived. The decomposition columns on the right are a "
+                    "duration approximation and are indicative only; JPM's own legs are just as "
+                    "extreme (Middle East YTD: spread +10.5%, Treasury -9.5%, netting +0.05%).")
         F(ws["A2"], italic=True, color=C_NOTE)
-        cols = [("", 30), ("Weight %", 10), ("Spread now", 11), ("Spread YTD bp", 13),
-                ("Treasury YTD bp", 14), ("Yield %", 9), ("Duration", 10),
-                ("YTD total %", 12), ("of which spread", 15), ("of which rates", 14),
-                ("carry & residual", 16), ("spread share", 12), ("read with care", 34)]
+        cols = [("", 30), ("Weight %", 10), ("Spread now", 11), ("Yield %", 9),
+                ("Return 1m %", 12), ("Return 3m %", 12), ("Return YTD %", 13),
+                ("Return 12m %", 13),
+                ("Spread 1m bp", 13), ("Spread YTD bp", 13), ("Treasury YTD bp", 14),
+                ("Duration", 10),
+                ("YTD: spread leg", 15), ("YTD: rate leg", 14), ("YTD: carry", 12),
+                ("read with care", 34)]
         hr = 4
         for i, (h, w) in enumerate(cols, start=1):
             H(ws.cell(row=hr, column=i), h)
@@ -803,34 +855,42 @@ class Dashboard:
                 continue          # not in the index at the latest date
             rows.append((w if sort_by_weight else 0, e, at, w))
         rows.sort(key=lambda t: -t[0])
+        d_1m, d_3m, d_12m = self._back(1), self._back(3), self._back(12)
         r = hr + 1
         for _k, e, at, w in rows:
             L(ws.cell(row=r, column=1), e, bold=False)
             V(ws.cell(row=r, column=2), w, fmt="0.00", color=C_HARD)
             V(ws.cell(row=r, column=3), self.p.get(self.d1, e, M_STW), fmt="0", color=C_HARD)
-            V(ws.cell(row=r, column=4), at.get("spread_bp"), fmt="+0;-0")
-            V(ws.cell(row=r, column=5), at.get("ust_bp"), fmt="+0;-0")
-            V(ws.cell(row=r, column=6), self.p.get(self.d1, e, M_YLD), fmt="0.00", color=C_HARD)
-            V(ws.cell(row=r, column=7), at.get("dur"), fmt="0.00")
-            V(ws.cell(row=r, column=8), at.get("total"), fmt="+0.00;-0.00", bold=True, color=C_HARD)
-            V(ws.cell(row=r, column=9), at.get("spread_leg"), fmt="+0.00;-0.00")
-            V(ws.cell(row=r, column=10), at.get("rate_leg"), fmt="+0.00;-0.00")
-            V(ws.cell(row=r, column=11), at.get("residual"), fmt="+0.00;-0.00")
-            tot, sl = at.get("total"), at.get("spread_leg")
-            share = (sl / tot) if (tot and abs(tot) >= 0.25 and sl is not None) else None
-            if share is None:
-                V(ws.cell(row=r, column=12), "n/m", fmt="General", color=C_NOTE)
-            else:
-                V(ws.cell(row=r, column=12), share, fmt="0%")
+            V(ws.cell(row=r, column=4), self.p.get(self.d1, e, M_YLD), fmt="0.00", color=C_HARD)
+            # total return, straight off the sub-index return series
+            for k, dd in enumerate([d_1m, d_3m, self.d0, d_12m], start=5):
+                val = self._chg(e, M_TRI, dd, self.d1)
+                cell = V(ws.cell(row=r, column=k), val, fmt="+0.00;-0.00",
+                         bold=(k == 7), color=C_HARD)
+                if val is not None:
+                    cell.fill = PatternFill("solid", fgColor=C_GOOD if val >= 0 else C_BAD)
+            V(ws.cell(row=r, column=9), self._chg(e, M_STW, d_1m, self.d1), fmt="+0;-0")
+            V(ws.cell(row=r, column=10), at.get("spread_bp"), fmt="+0;-0")
+            V(ws.cell(row=r, column=11), at.get("ust_bp"), fmt="+0;-0")
+            V(ws.cell(row=r, column=12), at.get("dur"), fmt="0.00")
+            V(ws.cell(row=r, column=13), at.get("spread_leg"), fmt="+0.00;-0.00", color=C_NOTE)
+            V(ws.cell(row=r, column=14), at.get("rate_leg"), fmt="+0.00;-0.00", color=C_NOTE)
+            V(ws.cell(row=r, column=15), at.get("residual"), fmt="+0.00;-0.00", color=C_NOTE)
             flag = at.get("flag") or ""
-            c = V(ws.cell(row=r, column=13), flag, fmt="General", color=C_NOTE)
+            c = V(ws.cell(row=r, column=16), flag, fmt="General", color=C_NOTE)
             c.alignment = Alignment(horizontal="left")
             F(c, italic=True, color=C_NOTE)
             if flag:
-                for cc in range(8, 13):
+                for cc in range(13, 16):
                     ws.cell(row=r, column=cc).fill = PatternFill("solid", fgColor=C_BAD)
             r += 1
         ws.freeze_panes = "B5"
+        r += 1
+        ws.cell(row=r, column=1, value=(
+            "Columns E-H are the numbers to use: actual total return over each window, from the "
+            "sub-index return series. Columns M-O are a duration decomposition and will not tie "
+            "to anyone else's attribution."))
+        F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
 
     # ---------- month-end sampling ----------
     def month_ends(self, n: int = 60) -> List[str]:
@@ -1046,20 +1106,32 @@ class Dashboard:
             ws.column_dimensions[get_column_letter(i)].width = 13
 
         r = 4
-        r = band(ws, r, 5, f"A. Spread responds to rates through beta ({BETAS['ust10y_bp']:.2f})")
-        for i, h in enumerate(["UST 10y change", "implied spread (bp)", "spread change (bp)",
+        ws.cell(row=3, column=1, value=(
+            f"US 10y {self.ust10y:.2f}%  ·  index Treasury anchor {self.ust_now:.2f}%  "
+            f"(term premium {self.term_premium * 100:+.0f}bp for {10.2:.1f}y average life)  ·  "
+            f"curve beta {CURVE_BETA:.2f}"))
+        F(ws.cell(row=3, column=1), italic=True, color=C_NOTE)
+        r = band(ws, r, 7, f"A. Spread responds to rates through beta ({BETAS['ust10y_bp']:.2f})")
+        for i, h in enumerate(["US 10y level", "10y change (bp)", "index anchor (%)",
+                               "implied spread (bp)", "spread change (bp)",
                                "12m total return %", "vs cash (pp)"], start=1):
             H(ws.cell(row=r, column=i), h)
         r += 1
-        for u in SENSITIVITY_UST:
+        for lvl in self.ust_grid:
+            u = (lvl - self.ust10y) * 100.0            # move in the 10y
+            anchor = lvl + self.term_premium + (CURVE_BETA - 1.0) * u / 100.0
+            du = (anchor - self.ust_now) * 100.0       # move the index actually feels
             sp = self.spread + BETAS["ust10y_bp"] * u
-            tr = total_return(self.yld, self.IRD, self.D, u, self.spread, sp)
-            L(ws.cell(row=r, column=1), f"{u:+d}bp", bold=(u == 0))
-            V(ws.cell(row=r, column=2), sp, fmt="0", color=C_HARD)
-            V(ws.cell(row=r, column=3), sp - self.spread, fmt="+0;-0")
-            V(ws.cell(row=r, column=4), tr, fmt="0.00", bold=True,
+            tr = total_return(self.yld, self.IRD, self.D, du, self.spread, sp)
+            L(ws.cell(row=r, column=1), f"{lvl:.2f}%",
+              bold=abs(u) < 1e-6, fill=C_BAND if abs(u) < 12.5 else None)
+            V(ws.cell(row=r, column=2), u, fmt="+0;-0")
+            V(ws.cell(row=r, column=3), anchor, fmt="0.00", color=C_HARD)
+            V(ws.cell(row=r, column=4), sp, fmt="0", color=C_HARD)
+            V(ws.cell(row=r, column=5), sp - self.spread, fmt="+0;-0")
+            V(ws.cell(row=r, column=6), tr, fmt="0.00", bold=True,
               fill=C_GOOD if tr >= CASH_RATE else C_BAD)
-            V(ws.cell(row=r, column=5), tr - CASH_RATE, fmt="+0.00;-0.00")
+            V(ws.cell(row=r, column=7), tr - CASH_RATE, fmt="+0.00;-0.00")
             r += 1
         r += 1
 
@@ -1077,6 +1149,13 @@ class Dashboard:
                   fill=C_GOOD if tr >= CASH_RATE else C_BAD)
             r += 1
         r += 1
+        ws.cell(row=r, column=1, value=(
+            "The index anchor column is the Treasury the index is actually exposed to: the 10y "
+            "plus the term premium for its 10.2y average life. At a curve beta of 1.00 the "
+            "premium cancels out of every change, so it is presentational; set the beta away "
+            "from 1.00 to model a flattening or steepening and it starts to bite."))
+        F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+        r += 2
         L(ws.cell(row=r, column=1), "break-even spread", bold=True)
         for j, u in enumerate(SENSITIVITY_UST, start=2):
             be = self.spread + (self.yld - self.IRD * (u / 100.0) - CASH_RATE) * 100.0 / self.D
@@ -1224,6 +1303,25 @@ class Dashboard:
                 "the legs. The same applies to the Middle East region, where the index weight fell",
                 "from 16.6% to 12.2% and composition, not price, is doing much of the work.",
             ]),
+            ("Term premium between the 10y and the index", [
+                "The index is not priced off the 10y. Its spread is struck at each bond's own",
+                "maturity and the cap-weighted average life is 10.2 years, so the Treasury it is",
+                f"exposed to sits further out: {UST10Y_NOW}% on the 10y against an index anchor of",
+                "yield less spread. The gap is term premium for the extra maturity and is close to",
+                "what the cross-sectional curve implies at 4.9bp per year of average life.",
+                "",
+                "Duration and average life answer different questions and both are needed. Duration",
+                "(6.22) sizes the P&L: 10bp is worth 0.62%. Average life (10.2y) picks WHICH rate,",
+                "which is why the 10y is the reference and the 5y is not. A single 10.2y bond with",
+                "this coupon would carry 7.4 duration; the index is shorter because duration is",
+                "concave in maturity and the index barbells short distressed paper (Iraq 0.9y,",
+                "Ethiopia 1.3y) against long investment grade (Peru 17.2y, Costa Rica 15.1y).",
+                "",
+                f"CURVE_BETA is {CURVE_BETA:.2f}: the anchor moves one-for-one with the 10y, so the",
+                "premium cancels out of every change and the adjustment is presentational. It only",
+                "bites if you model a flattening or steepening, and it cannot be estimated from",
+                "these files because none of them carries a 10y series.",
+            ]),
             ("Forecast", [
                 "Betas are practitioner priors, not regression estimates.",
                 "The known weakness: the rates beta is unconditional and cannot distinguish a rate rise",
@@ -1271,9 +1369,17 @@ class Dashboard:
 # Needs python-pptx (pip install python-pptx); if it is missing the deck is
 # skipped with a message rather than the whole run failing.
 
-PPT_INK, PPT_DEEP, PPT_GOLD = (0x1B, 0x2A, 0x41), (0x24, 0x39, 0x5B), (0xC9, 0x92, 0x2C)
-PPT_GOOD, PPT_BAD, PPT_MUTE = (0x2F, 0x6B, 0x4F), (0xA8, 0x3A, 0x32), (0x6B, 0x7A, 0x90)
-PPT_PAPER, PPT_SOFT = (0xFF, 0xFF, 0xFF), (0xF1, 0xF4, 0xF8)
+# Blue, red, grey, black only. Arial throughout.
+PPT_INK = (0x00, 0x00, 0x00)             # body text
+PPT_BLUE = (0x00, 0x2B, 0x5C)            # headings, table headers, primary series
+PPT_BLUE2 = (0x00, 0x33, 0xA0)           # secondary blue
+PPT_RED = (0xC8, 0x10, 0x2E)             # negatives, warnings
+PPT_GREY = (0x8C, 0x8C, 0x8C)            # secondary series
+PPT_MUTE = (0x59, 0x59, 0x59)            # captions
+PPT_PAPER, PPT_SOFT = (0xFF, 0xFF, 0xFF), (0xEF, 0xF2, 0xF6)
+PPT_BLUE = PPT_BLUE                       # retained name, no gold in the palette
+PPT_DEEP = PPT_BLUE
+PPT_GOOD = PPT_BLUE
 
 
 def month_bounds(panel: Panel) -> Tuple[Optional[str], str, str]:
@@ -1299,11 +1405,12 @@ def monthly_highlights(panel: Panel, d0: Optional[str], d1: str,
         word = "returned" if tot >= 0 else "lost"
         out.append(f"EMBIGD {word} {abs(tot):.2f}% on the month, with the index spread "
                    f"{'tighter' if (sb or 0) < 0 else 'wider'} by {abs(sb or 0):.0f}bp to {sp:.0f}bp.")
-    sl, rl = idx.get("spread_leg"), idx.get("rate_leg")
-    if sl is not None and rl is not None:
-        lead = "spread" if abs(sl) >= abs(rl) else "rates"
-        out.append(f"The month was a {lead} story: the spread move was worth {sl:+.2f}% and the "
-                   f"Treasury move {rl:+.2f}%, with {idx.get('residual', 0):+.2f}% of carry and roll.")
+    sb2 = idx.get("spread_bp")
+    ub2 = idx.get("ust_bp")
+    if sb2 is not None and ub2 is not None:
+        lead = "spreads" if abs(sb2) >= abs(ub2) else "Treasury yields"
+        out.append(f"{lead.capitalize()} did most of the work: spreads {sb2:+.0f}bp against "
+                   f"{ub2:+.0f}bp on the underlying Treasury.")
     # regions
     reg = []
     for e in REGIONS:
@@ -1367,7 +1474,7 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         return RGBColor(*t)
 
     def txt(sl, x, y, w, h, text, size=14, bold=False, color=PPT_INK,
-            font="Calibri", align=PP_ALIGN.LEFT, italic=False):
+            font="Arial", align=PP_ALIGN.LEFT, italic=False):
         tb = sl.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
         tf = tb.text_frame
         tf.word_wrap = True
@@ -1391,14 +1498,51 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
             r = p.add_run()
             r.text = "•  " + it
             r.font.size = Pt(size)
-            r.font.name = "Calibri"
-            r.font.color.rgb = rgb(PPT_BAD if it.startswith("NOTE:") else PPT_INK)
+            r.font.name = "Arial"
+            r.font.color.rgb = rgb(PPT_RED if it.startswith("NOTE:") else PPT_INK)
             r.font.bold = it.startswith("NOTE:")
         return tb
 
+    def style_chart(gf, colours, numfmt='+0.0;-0.0', label_size=9):
+        """Category labels pinned low so a negative bar never sits on top of
+        them, and series in blue/grey/red only."""
+        gf.has_title = False
+        ca = gf.category_axis
+        # python-pptx writes tickLblPos="nextTo" on a new chart and the setter
+        # does not always stick, so set the element itself. "low" pins the
+        # category labels to the bottom of the plot area, which is what keeps
+        # them readable when a bar runs negative.
+        try:
+            el = ca._element.find(
+                '{http://schemas.openxmlformats.org/drawingml/2006/chart}tickLblPos')
+            if el is not None:
+                el.set("val", "low")
+        except Exception:
+            pass
+        ca.tick_labels.font.size = Pt(11)
+        ca.tick_labels.font.name = "Arial"
+        ca.tick_labels.font.color.rgb = rgb(PPT_INK)
+        va = gf.value_axis
+        va.tick_labels.font.size = Pt(10)
+        va.tick_labels.font.name = "Arial"
+        va.tick_labels.font.color.rgb = rgb(PPT_MUTE)
+        va.has_major_gridlines = True
+        pl = gf.plots[0]
+        pl.has_data_labels = True
+        pl.data_labels.number_format = numfmt
+        pl.data_labels.number_format_is_linked = False
+        pl.data_labels.font.size = Pt(label_size)
+        pl.data_labels.font.name = "Arial"
+        pl.data_labels.font.color.rgb = rgb(PPT_INK)
+        for k, col in enumerate(colours):
+            if k < len(pl.series):
+                f_ = pl.series[k].format.fill
+                f_.solid(); f_.fore_color.rgb = rgb(col)
+        return gf
+
     def fill(sl, x, y, w, h, color):
         from pptx.enum.shapes import MSO_SHAPE
-        sh = sl.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y),
+        sh = sl.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y),
                                  Inches(w), Inches(h))
         sh.fill.solid(); sh.fill.fore_color.rgb = rgb(color)
         sh.line.fill.background()
@@ -1420,11 +1564,11 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
                 p.alignment = PP_ALIGN.LEFT if j == 0 else PP_ALIGN.RIGHT
                 for r_ in p.runs:
                     r_.font.size = Pt(size)
-                    r_.font.name = "Calibri"
+                    r_.font.name = "Arial"
                     r_.font.bold = (i == 0 and header)
                     r_.font.color.rgb = rgb(PPT_PAPER if (i == 0 and header) else PPT_INK)
                 c.fill.solid()
-                c.fill.fore_color.rgb = rgb(PPT_DEEP if (i == 0 and header)
+                c.fill.fore_color.rgb = rgb(PPT_BLUE if (i == 0 and header)
                                             else (PPT_SOFT if i % 2 else PPT_PAPER))
         return gt
 
@@ -1434,37 +1578,62 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
 
     # ---------- 1. headline ----------
     s1 = prs.slides.add_slide(blank)
-    bg = s1.background.fill; bg.solid(); bg.fore_color.rgb = rgb(PPT_INK)
-    txt(s1, 0.7, 0.7, 12, 0.9, f"EMBI Global Diversified — {label}", 40, True,
-        PPT_PAPER, "Cambria")
-    txt(s1, 0.7, 1.65, 12, 0.4,
-        f"Month to {d1}" + (f", against {d0}" if d0 else ""), 15, False, (0xAE, 0xBD, 0xD1))
+    txt(s1, 0.7, 0.6, 12, 0.9, f"EMBI Global Diversified — {label}", 34, True,
+        PPT_BLUE, "Arial")
+    txt(s1, 0.7, 1.45, 12, 0.4,
+        f"Month to {d1}" + (f", against {d0}" if d0 else ""), 14, False, PPT_MUTE)
     tiles = [(f"{(idx or {}).get('total', 0):+.2f}%", "total return on the month", PPT_PAPER),
              (f"{sp:.0f}bp", "index spread", PPT_PAPER),
-             (f"{(idx or {}).get('spread_bp', 0):+.0f}bp", "spread move on the month", PPT_GOLD),
-             (f"{ytd.get('total', 0):+.2f}%", f"total return YTD {dash.year}", PPT_GOLD)]
+             (f"{(idx or {}).get('spread_bp', 0):+.0f}bp", "spread move on the month", PPT_BLUE),
+             (f"{ytd.get('total', 0):+.2f}%", f"total return YTD {dash.year}", PPT_BLUE)]
     for i, (v, l, c) in enumerate(tiles):
         x = 0.7 + i * 3.05
-        fill(s1, x, 2.4, 2.8, 1.8, PPT_DEEP)
-        txt(s1, x, 2.6, 2.8, 0.8, v, 36, True, c, "Cambria", PP_ALIGN.CENTER)
-        txt(s1, x + 0.15, 3.42, 2.5, 0.7, l, 11, False,
-                 (0xAE, 0xBD, 0xD1), "Calibri", PP_ALIGN.CENTER)
-    fill(s1, 0.7, 4.5, 11.9, 1.9, PPT_PAPER)
-    txt(s1, 1.0, 4.7, 11.3, 0.3, "What drove the month", 13, True, PPT_GOLD)
+        fill(s1, x, 2.2, 2.8, 1.65, PPT_SOFT)
+        neg = v.startswith("-")
+        txt(s1, x, 2.4, 2.8, 0.7, v, 32, True, PPT_RED if neg else PPT_BLUE,
+            "Arial", PP_ALIGN.CENTER)
+        txt(s1, x + 0.15, 3.15, 2.5, 0.6, l, 11, False, PPT_MUTE, "Arial", PP_ALIGN.CENTER)
+    txt(s1, 0.7, 4.3, 11.3, 0.3, "What drove the month", 13, True, PPT_BLUE)
+    q = dash._chg(INDEX, M_TRI, dash._back(3), d1)
+    y1 = dash._chg(INDEX, M_TRI, dash._back(12), d1)
     if idx:
-        bullets(s1, 1.0, 5.05, 11.2, 1.2, [
-            f"Spread move worth {idx.get('spread_leg', 0):+.2f}%, Treasury move "
-            f"{idx.get('rate_leg', 0):+.2f}%, carry and roll {idx.get('residual', 0):+.2f}%.",
-            f"Year to date: {ytd.get('total', 0):+.2f}% total return, spread "
-            f"{ytd.get('spread_bp', 0):+.0f}bp, underlying Treasury {ytd.get('ust_bp', 0):+.0f}bp.",
+        bullets(s1, 0.7, 4.65, 11.9, 1.0, [
+            f"Total return: {idx.get('total', 0):+.2f}% past month, "
+            + (f"{q:+.2f}% over three months, " if q is not None else "")
+            + f"{ytd.get('total', 0):+.2f}% year to date"
+            + (f", {y1:+.2f}% over twelve." if y1 is not None else "."),
+            f"Spreads {idx.get('spread_bp', 0):+.0f}bp on the month and "
+            f"{ytd.get('spread_bp', 0):+.0f}bp year to date, against a move of "
+            f"{ytd.get('ust_bp', 0):+.0f}bp in the underlying Treasury.",
         ], 13)
-    txt(s1, 0.7, 6.85, 11.9, 0.3,
-        "Source: JPM EMBI Global Diversified. Spread changes chain-linked across basis breaks.",
-        9, False, (0x7E, 0x90, 0xA8))
+    hist = [(d, panel.get(d, INDEX, M_STW)) for d in dash.month_ends(13)]
+    hist = [(d, v_) for d, v_ in hist if v_ is not None]
+    if len(hist) >= 4:
+        txt(s1, 0.7, 5.55, 11.9, 0.3, "Index spread, last twelve months (bp)", 13, True, PPT_BLUE)
+        cd2 = CategoryChartData()
+        cd2.categories = [d[:7] for d, _ in hist]
+        cd2.add_series("Spread", [v_ for _, v_ in hist])
+        gf2 = s1.shapes.add_chart(XL_CHART_TYPE.LINE, Inches(0.7), Inches(5.85),
+                                  Inches(11.9), Inches(1.0), cd2).chart
+        gf2.has_legend = False
+        gf2.has_title = False
+        ca2 = gf2.category_axis
+        ca2.tick_labels.font.size = Pt(8)
+        ca2.tick_labels.font.name = "Arial"
+        ca2.tick_labels.font.color.rgb = rgb(PPT_MUTE)
+        va2 = gf2.value_axis
+        va2.tick_labels.font.size = Pt(8)
+        va2.tick_labels.font.name = "Arial"
+        va2.tick_labels.font.color.rgb = rgb(PPT_MUTE)
+        ln = gf2.plots[0].series[0].format.line
+        ln.color.rgb = rgb(PPT_BLUE); ln.width = Pt(2)
+    txt(s1, 0.7, 6.95, 11.9, 0.3,
+        "Source: JPM EMBI Global Diversified. Spread changes chain-linked across basis breaks; "
+        "the level series is shown as published.", 9, False, PPT_MUTE)
 
     # ---------- 2. by region: past month AND year to date ----------
     s2 = prs.slides.add_slide(blank)
-    txt(s2, 0.7, 0.5, 12, 0.7, "Performance by region", 34, True, PPT_INK, "Cambria")
+    txt(s2, 0.7, 0.5, 12, 0.7, "Performance by region", 34, True, PPT_INK, "Arial")
     txt(s2, 0.7, 1.2, 12, 0.35,
         f"Past month {d0} to {d1}  ·  year to date from {dash.d0}", 14, False, PPT_MUTE)
     reg = []
@@ -1481,19 +1650,12 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         cd.add_series("Year to date %", [y["total"] for _e, _m, y, _f in reg])
         gf = s2.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(0.7), Inches(1.75),
                                  Inches(6.3), Inches(4.3), cd).chart
-        gf.has_title = False
         gf.has_legend = True
         gf.legend.position = XL_LEGEND_POSITION.BOTTOM
         gf.legend.include_in_layout = False
         gf.legend.font.size = Pt(11)
-        pl = gf.plots[0]
-        pl.has_data_labels = True
-        pl.data_labels.number_format = '+0.0;-0.0'
-        pl.data_labels.number_format_is_linked = False
-        pl.data_labels.font.size = Pt(9)
-        for k, col in enumerate([PPT_MUTE, PPT_DEEP]):
-            f_ = pl.series[k].format.fill
-            f_.solid(); f_.fore_color.rgb = rgb(col)
+        gf.legend.font.name = "Arial"
+        style_chart(gf, [PPT_GREY, PPT_BLUE])
         rows = [["Region", "Wt %", "Spread", "1m bp", "1m %", "YTD bp", "YTD %"]]
         for e, m, y, full in reg:
             rows.append([e, f"{panel.get(d1, full, M_WGT) or 0:.1f}",
@@ -1514,11 +1676,11 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         "the change is the market's.",
         11, False, PPT_MUTE, italic=True)
     txt(s2, 0.7, 6.85, 11.9, 0.3, f"Source: JPM EMBI Global Diversified, {d1}.",
-        9, False, (0x93, 0xA1, 0xB5))
+        9, False, PPT_MUTE)
 
     # ---------- 3. highlights ----------
     s3 = prs.slides.add_slide(blank)
-    txt(s3, 0.7, 0.5, 12, 0.7, f"{label} — highlights", 34, True, PPT_INK, "Cambria")
+    txt(s3, 0.7, 0.5, 12, 0.7, f"{label} — highlights", 34, True, PPT_INK, "Arial")
     hl = monthly_highlights(panel, d0, d1, dash.breaks, dash.countries)
     bullets(s3, 0.7, 1.5, 7.4, 4.8, hl, 13)
     rows = [["Rating bucket", "Wt %", "Spread", "1m %", "YTD %"]]
@@ -1535,11 +1697,11 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
     if len(rows) > 1:
         table(s3, 8.3, 1.6, 4.3, rows, [1.35, 0.65, 0.8, 0.75, 0.75], size=11)
     txt(s3, 0.7, 6.85, 11.9, 0.3, "Highlights generated from the underlying series, not re-keyed.",
-        9, False, (0x93, 0xA1, 0xB5))
+        9, False, PPT_MUTE)
 
     # ---------- 3b. who is killing it ----------
     s5 = prs.slides.add_slide(blank)
-    txt(s5, 0.7, 0.5, 12, 0.7, "Where the performance came from", 34, True, PPT_INK, "Cambria")
+    txt(s5, 0.7, 0.5, 12, 0.7, "Where the performance came from", 34, True, PPT_INK, "Arial")
     txt(s5, 0.7, 1.2, 12, 0.35,
         "Countries above 0.25% of the index, ranked by total return. Past month on the left, "
         "year to date on the right.", 14, False, PPT_MUTE)
@@ -1561,8 +1723,7 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         rk = ranked(dfrom)
         if not rk:
             continue
-        fill(s5, x, 1.75, 5.8, 0.4, PPT_DEEP)
-        txt(s5, x + 0.2, 1.83, 5.4, 0.3, head, 13, True, PPT_GOLD)
+        txt(s5, x, 1.8, 5.4, 0.3, head, 14, True, PPT_BLUE)
         rows = [["Leaders", "Wt %", "Spread bp", "Return %"]]
         for t, e, at in rk[:7]:
             rows.append([e[:20], f"{panel.get(d1, e, M_WGT) or 0:.1f}",
@@ -1575,46 +1736,47 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         table(s5, x, 4.9, 5.8, rows, [2.6, 0.9, 1.15, 1.15], size=11)
     txt(s5, 0.7, 6.85, 11.9, 0.3,
         "Spread changes chain-linked; names below 0.25% of the index are excluded so the list "
-        "is not dominated by positions too small to trade.", 9, False, (0x93, 0xA1, 0xB5))
+        "is not dominated by positions too small to trade.", 9, False, PPT_MUTE)
 
     # ---------- 4. projections ----------
     s4 = prs.slides.add_slide(blank)
-    txt(s4, 0.7, 0.5, 12, 0.7, "Projections — US 10-year scenarios", 34, True, PPT_INK, "Cambria")
-    txt(s4, 0.7, 1.2, 12, 0.35,
-        f"Spread responds through beta {BETAS['ust10y_bp']:.2f}; return at duration "
-        f"{dash.D:.2f} against cash at {CASH_RATE:.2f}%.", 14, False, PPT_MUTE)
-    rows = [["US 10y", "Spread (bp)", "12m return %", "vs cash (pp)"]]
+    txt(s4, 0.7, 0.5, 12, 0.7, "Projections — US 10-year scenarios", 34, True, PPT_INK, "Arial")
+    txt(s4, 0.7, 1.2, 12, 0.4,
+        f"US 10y at {dash.ust10y:.2f}%. The index is struck at 10.2y average life, so the "
+        f"Treasury it is exposed to sits {dash.term_premium * 100:+.0f}bp further out at "
+        f"{dash.ust_now:.2f}%. Spread beta {BETAS['ust10y_bp']:.2f}, duration {dash.D:.2f}, "
+        f"cash {CASH_RATE:.2f}%.", 13, False, PPT_MUTE)
+    rows = [["US 10y", "Index anchor", "Spread (bp)", "12m return %", "vs cash (pp)"]]
     cats, vals = [], []
-    for u in SENSITIVITY_UST:
+    for lvl in dash.ust_grid:
+        u = (lvl - dash.ust10y) * 100.0
+        anchor = lvl + dash.term_premium + (CURVE_BETA - 1.0) * u / 100.0
+        du = (anchor - dash.ust_now) * 100.0
         s_ = sp + BETAS["ust10y_bp"] * u
-        tr = total_return(dash.yld, dash.IRD, dash.D, u, sp, s_)
-        rows.append([f"{u:+d}bp", f"{s_:.0f}", f"{tr:.2f}", f"{tr - CASH_RATE:+.2f}"])
-        cats.append(f"{u:+d}")
+        tr = total_return(dash.yld, dash.IRD, dash.D, du, sp, s_)
+        rows.append([f"{lvl:.2f}%", f"{anchor:.2f}%", f"{s_:.0f}", f"{tr:.2f}",
+                     f"{tr - CASH_RATE:+.2f}"])
+        cats.append(f"{lvl:.2f}%")
         vals.append(tr)
-    table(s4, 0.7, 1.9, 5.0, rows, [1.2, 1.3, 1.3, 1.2])
+    table(s4, 0.7, 1.95, 5.6, rows, [1.05, 1.2, 1.15, 1.15, 1.05], size=11)
     cd = CategoryChartData()
     cd.categories = cats
     cd.add_series("12m total return %", vals)
     gf = s4.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(6.2), Inches(1.9),
                              Inches(6.4), Inches(3.6), cd).chart
     gf.has_legend = False
-    gf.has_title = False
-    pl = gf.plots[0]
-    pl.has_data_labels = True
-    pl.data_labels.number_format = '0.00'
-    pl.data_labels.number_format_is_linked = False
-    pl.data_labels.font.size = Pt(10)
-    ser = pl.series[0]
-    ser.format.fill.solid(); ser.format.fill.fore_color.rgb = rgb(PPT_DEEP)
+    style_chart(gf, [PPT_BLUE], numfmt='0.00', label_size=10)
     be = sp + (dash.yld - CASH_RATE) * 100.0 / dash.D
     txt(s4, 0.7, 5.85, 11.9, 0.9,
-        f"Break-even: the call stops beating cash at {be:.0f}bp with rates unchanged. "
+        f"Break-even: the call stops beating cash at {be:.0f}bp with the 10y at "
+        f"{dash.ust10y:.2f}%. "
         f"Scenarios hold spread and rates linked through beta; in a genuine risk-off the "
         f"Treasury rally offsets part of the widening, so this is the conservative read.",
         12, False, PPT_INK, italic=True)
     txt(s4, 0.7, 6.85, 11.9, 0.3,
-        "Betas are practitioner priors, not fitted. The rates beta is unverified — see the "
-        "workbook's Methodology tab.", 9, False, (0x93, 0xA1, 0xB5))
+        f"Curve beta {CURVE_BETA:.2f} (parallel shift). Betas are practitioner priors, not "
+        f"fitted; the rates beta is unverified — see the workbook's Methodology tab.",
+        9, False, PPT_MUTE)
 
     prs.save(str(path))
     return True
