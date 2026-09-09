@@ -1,0 +1,10 @@
+# One row per month, oldest first. Yields in PERCENT (4.57, not 0.0457).
+# ust10y is required. ust2y feeds the 2s10s slope factor used by the default
+#   'level_slope' specification. ust5y is only needed for --spec front.
+# regime: 1 = the rate move came with risk aversion (inflation/policy shock),
+#         0 = it came with growth. Leave blank if you have no view - the
+#         conditional block is then skipped rather than guessed.
+# Do NOT derive regime from VIX: VIX is already a regressor, and conditioning
+#   on it manufactures a difference between the two betas even when none exists.
+date,ust2y,ust5y,ust10y,dxy,vix,regime
+2026-01-31,,,,,,
