@@ -578,7 +578,10 @@ def chain_change(panel: "Panel", e: str, metric: str, d0: Optional[str], d1: str
     naive = None
     if v0 is not None and v1 is not None:
         naive = (v1 / v0 - 1.0) * 100.0 if metric == M_TRI else (v1 - v0) * scale
-    breaks = panel.breaks_for(e)          # the entity's own break days, not the index's
+    # Chain across the entity's own break days. A name that trades on price (Venezuela,
+    # Lebanon, Ukraine at the lows) steps so often that its own list would swallow the
+    # real moves, so for those only the index-wide methodology days are skipped.
+    breaks = panel.breaks_for(e) if panel.spread_meaningful(e) else panel.breaks_for(INDEX)
     window = [d for d in panel.dates() if d0 <= d <= d1]
     crossed = any(d in breaks for d in window[1:])
     if metric == M_TRI or not crossed:
@@ -596,6 +599,24 @@ def chain_change(panel: "Panel", e: str, metric: str, d0: Optional[str], d1: str
             tot += (cur - prev) * scale
         prev = cur
     return tot, naive, True
+
+
+def nearest_date(dates: Sequence[str], d1: str, days_back: int,
+                 tolerance: int = 10) -> Optional[str]:
+    """The observation closest to `days_back` days before d1.
+
+    The history is not daily-complete and the JP latest file arrives whenever it
+    is downloaded, so there is rarely a point exactly one month back. Rather than
+    insisting on the last date on or before the target (which can land 5-10 days
+    early after a gap), take the nearest available date on either side, preferring
+    the earlier one on a tie. If nothing sits within `tolerance` days of the target
+    the window is not a month and None is returned so the column stays blank."""
+    target = dt(d1) - timedelta(days=days_back)
+    cands = [(abs((dt(d) - target).days), dt(d) > target, d) for d in dates if d < d1]
+    if not cands:
+        return None
+    gap, _later, d = min(cands)
+    return d if gap <= tolerance + max(0, days_back // 30 - 1) * 3 else None
 
 
 def year_start(panel: Panel, year: int) -> Optional[str]:
@@ -634,14 +655,9 @@ def attribute(panel: Panel, e: str, d0: str, d1: str) -> Optional[Dict[str, Any]
     breaks = getattr(panel, "_breaks", {}) or {}
     chained, naive, crossed = chain_change(panel, e, M_STW, d0, d1, breaks)
     move = chained if chained is not None else (s1 - s0)
-    if not panel.spread_meaningful(e):
-        out["spread_bp"] = None
-        out["spread_bp_naive"] = naive
-        out["crossed_break"] = crossed
-        out["dur"], out["dur_src"] = D, src
-        out["flag"] = "spread not meaningful — trades on price (defaulted / distressed)"
-        return out
     out["spread_bp"] = move
+    if not panel.spread_meaningful(e):
+        out["price_driven"] = True   # spread change shown, but it is a price move in disguise
     out["spread_bp_naive"] = naive
     out["crossed_break"] = crossed
     out["dur"], out["dur_src"] = D, src
@@ -1095,9 +1111,10 @@ class Dashboard:
         return chained
 
     def _back(self, months: int) -> Optional[str]:
-        target = dt(self.d1) - timedelta(days=int(round(months * 30.44)))
-        prior = [d for d in self.dates if dt(d) <= target]
-        return prior[-1] if prior else None
+        """Start date for a trailing window: the nearest available observation to
+        `months` x 30.44 days back, either side. Every header that uses it prints
+        the date actually used, so a 28- or 33-day 'month' is never hidden."""
+        return nearest_date(self.dates, self.d1, int(round(months * 30.44)))
 
     # ---------- the three time-series tabs ----------
     def _metric_tab(self, sheet: str, metric: str, title: str, unit: str,
@@ -1146,8 +1163,7 @@ class Dashboard:
                 V(ws.cell(row=r, column=2), self.p.get(self.d1, e, metric),
                   fmt=level_fmt, color=C_HARD, bold=is_agg)
                 for k, dd in enumerate([d_1m, d_3m, self.d0, d_12m], start=3):
-                    val = (self._chg(e, metric, dd, self.d1)
-                           if metric == M_TRI or self.p.spread_meaningful(e) else None)
+                    val = self._chg(e, metric, dd, self.d1)
                     cell = V(ws.cell(row=r, column=k), val, fmt=chg_fmt, bold=is_agg)
                     if val is not None and abs(val) > 1e-9:
                         good = (val > 0) if metric == M_TRI else (val < 0)
@@ -2147,11 +2163,10 @@ PPT_GOOD = PPT_BLUE
 def month_bounds(panel: Panel) -> Tuple[Optional[str], str, str]:
     """(one month back, latest, label). Trailing from the run date, not the
     calendar month end - a deck run on the 20th should cover the last month,
-    not the three weeks since the 1st."""
+    not the three weeks since the 1st. The start is whatever observation sits
+    closest to 30 days back — see nearest_date()."""
     d1 = panel.dates()[-1]
-    target = dt(d1) - timedelta(days=30)
-    prior = [d for d in panel.dates() if dt(d) <= target]
-    return (prior[-1] if prior else None), d1, dt(d1).strftime("%B %Y")
+    return nearest_date(panel.dates(), d1, 30), d1, dt(d1).strftime("%B %Y")
 
 
 def monthly_highlights(panel: Panel, d0: Optional[str], d1: str,
@@ -2236,7 +2251,7 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         return RGBColor(*t)
 
     def bp(v) -> str:
-        return "n/a" if v is None else f"{v:+.0f}"
+        return "" if v is None else f"{v:+.0f}"
 
     def txt(sl, x, y, w, h, text, size=14, bold=False, color=PPT_INK,
             font="Arial", align=PP_ALIGN.LEFT, italic=False):
@@ -2303,6 +2318,15 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
             if k < len(pl.series):
                 f_ = pl.series[k].format.fill
                 f_.solid(); f_.fore_color.rgb = rgb(col)
+        # Any bar below zero is red, whatever its series colour.
+        try:
+            for se in pl.series:
+                for i, v in enumerate(se.values):
+                    if v is not None and v < 0:
+                        pf = se.points[i].format.fill
+                        pf.solid(); pf.fore_color.rgb = rgb(PPT_RED)
+        except Exception:
+            pass
         return gf
 
     def fill(sl, x, y, w, h, color):
@@ -2655,6 +2679,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     known = panel.entities()
     archive = folder / ARCHIVE_DIR
+    # JPM downloads are recognised by content (a 'Bam Id' header), never by name,
+    # so the file can be called 'JP latest.csv' and overwritten every time. Each one
+    # is copied into the archive under its own data date, so overwriting loses nothing.
     files = sorted(folder.glob("*.csv"))
     if archive.exists():
         files += sorted(archive.glob("*.csv"))
@@ -2717,6 +2744,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         diff = (at.get("total") or 0) - jt
         flag = "OK" if abs(diff) < 0.02 else "CHECK"
         print(f"   vs JPM published total    {jt:+7.2f}%   diff {diff:+.3f}pp  [{flag}]")
+
+    for lbl, n in [("1 month", 30), ("3 months", 91), ("12 months", 365)]:
+        w0 = nearest_date(dates, d1, n)
+        if w0:
+            print(f"   {lbl:>9} window: {w0} -> {d1}  ({(dt(d1) - dt(w0)).days} days; "
+                  f"nearest available observation to {n} days back)")
+        else:
+            print(f"   {lbl:>9} window: no observation within reach of {n} days back — left blank")
 
     if a.check:
         return 0
