@@ -340,9 +340,15 @@ class Panel:
         return n
 
     def load_extended_csv(self, path: Path) -> int:
+        """Load the growing copy. The history workbook has already been loaded and
+        always wins on a date both hold (setdefault). Before anything is taken from
+        the copy, its index level is checked against the workbook on every shared
+        date: if it disagrees the copy was built from the wrong index (EMBI Global,
+        not Diversified) and it is ignored, so a stale file can never contaminate
+        the run. Returns the number of rows loaded, or -1 if the file was rejected."""
         if not path.exists():
             return 0
-        n = 0
+        rows: List[Tuple[str, Dict[Tuple[str, str], float]]] = []
         with path.open("r", newline="", encoding="utf-8-sig") as f:
             rd = csv.reader(f)
             hdr = next(rd, None)
@@ -353,15 +359,34 @@ class Panel:
                 d = to_date(row[0]) if row else None
                 if not d:
                     continue
-                bucket = self.data.setdefault(d, {})
+                vals: Dict[Tuple[str, str], float] = {}
                 for j, key in cols.items():
                     if key is None or j >= len(row):
                         continue
                     v = num(row[j])
                     if v is not None:
-                        bucket.setdefault(key, v)
-                self.sources.setdefault(d, "extended csv")
-                n += 1
+                        vals[key] = v
+                rows.append((d, vals))
+        # consistency check against what is already loaded from the workbook
+        bad = 0
+        for d, vals in rows:
+            have = self.data.get(d, {}).get((INDEX, M_TRI))
+            mine = vals.get((INDEX, M_TRI))
+            if have is not None and mine is not None and abs(mine / have - 1.0) > 0.005:
+                bad += 1
+        if bad:
+            print(f"IGNORED  : {path.name} disagrees with the history workbook on {bad} date(s) "
+                  f"— it was built from a different index. Not loaded; a clean copy will be "
+                  f"written from the workbook and this run's JP latest. Delete "
+                  f"{ARCHIVE_DIR}/ too if it holds old EMBI Global files.", file=sys.stderr)
+            return -1
+        n = 0
+        for d, vals in rows:
+            bucket = self.data.setdefault(d, {})
+            for key, v in vals.items():
+                bucket.setdefault(key, v)
+            self.sources.setdefault(d, "extended csv")
+            n += 1
         return n
 
     def load_extras_csv(self, path: Path) -> None:
@@ -2677,18 +2702,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("History  : none found — starting from snapshots alone", file=sys.stderr)
 
     n_ext = panel.load_extended_csv(folder / EXTENDED_CSV)
-    if n_ext:
-        print(f"Extended : {EXTENDED_CSV} — {n_ext:,} rows")
-    panel.load_extras_csv(folder / EXTRAS_CSV)
+    if n_ext > 0:
+        print(f"Extended : {EXTENDED_CSV} — {n_ext:,} rows (workbook wins on shared dates)")
+    if n_ext >= 0:
+        panel.load_extras_csv(folder / EXTRAS_CSV)   # extras belong to the same copy
 
     known = panel.entities()
     archive = folder / ARCHIVE_DIR
     # JPM downloads are recognised by content (a 'Bam Id' header), never by name,
     # so the file can be called 'JP latest.csv' and overwritten every time. Each one
     # is copied into the archive under its own data date, so overwriting loses nothing.
+    # The archive is WRITE-ONLY: a backup copy of each file ingested, never read back.
+    # The data itself lives in the history workbook plus EMBI_history_extended.csv,
+    # which grows with every JP latest you drop in the folder.
     files = sorted(folder.glob("*.csv"))
-    if archive.exists():
-        files += sorted(archive.glob("*.csv"))
     added = 0
     rejected = 0
     for p in files:
