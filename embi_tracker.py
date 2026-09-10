@@ -2653,7 +2653,8 @@ def find_history_xlsx(folder: Path) -> Optional[Path]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="EMBI Global Diversified tracker.")
-    ap.add_argument("--dir", default=".", help="folder to work in (default: current)")
+    ap.add_argument("--dir", default=None,
+                    help="folder to work in (default: the folder this script sits in)")
     ap.add_argument("--history", default=None, help="path to the history workbook")
     ap.add_argument("--output", "-o", default=OUTPUT_XLSX)
     ap.add_argument("--no-build", action="store_true", help="ingest only")
@@ -2662,7 +2663,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--deck", default=None, help="PowerPoint filename (default: EMBI_Monthly_<month>.pptx)")
     a = ap.parse_args(argv)
 
-    folder = Path(a.dir).expanduser().resolve()
+    # Default to the script's own folder, not the shell's current directory, so it
+    # behaves the same whether run from a terminal, an IDE or a double-click.
+    folder = (Path(a.dir).expanduser() if a.dir else Path(__file__).parent).resolve()
+    print(f"Folder   : {folder}")
     panel = Panel()
 
     hist = Path(a.history).expanduser() if a.history else find_history_xlsx(folder)
