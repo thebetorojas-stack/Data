@@ -85,6 +85,19 @@ REPORT_DATE_FMT = f'{_REPORT_DATE:%b} {_REPORT_DATE.day}, {_REPORT_DATE.year}'
 OFFSHORE_COVER_DATE_CELL = ('Cover', 1, 13)
 ONSHORE_COVER_DATE_CELL  = ('Cover', 1, 13)
 
+# ── Credit Risk Flag (Instrument) cell colours — BondList column T ────────
+# The flag cell's fill must match the flag written in it. These are the
+# UBS credit-view colours already used by the templates (and by the PDF's
+# credit-view boxes): olive green / amber / red. Values: (fill, font colour)
+# as 'RRGGBB'; fill None = no fill (used for bonds without a flag, '-').
+RISK_FLAG_COL = 'T'
+RISK_FLAG_COLORS = {
+    'GREEN':  ('778D43', 'FFFFFF'),   # olive green, white text
+    'YELLOW': ('FFBF00', '000000'),   # amber,       black text
+    'RED':    ('FF0000', 'FFFFFF'),   # red,         white text
+    '-':      (None,     '000000'),   # no flag → no fill, black text
+}
+
 # ── US Onshore eligibility ────────────────────────────────────────────────
 ONSHORE_SOV_EXCLUDED_COUNTRIES = {
     'AR', 'VE', 'BH', 'EG', 'KE', 'LK', 'NG',
@@ -781,6 +794,19 @@ def _build_bondlist_rows_xml(editor: _XlsxEditor, bond_rows, data, schema,
     if date_style_idx and 'I' in styles:
         styles['I'] = date_style_idx
 
+    # Credit Risk Flag (column T): the fill must follow the VALUE of the
+    # cell. Borrowing row 9's style verbatim painted every row with whatever
+    # colour row 9's bond happened to have (all-green offshore, all-amber
+    # onshore). Build one style variant per flag from the borrowed style so
+    # borders / font / alignment stay identical and only fill + font colour
+    # change. Non-flag values ('-') get the same style with no fill.
+    flag_styles = {}
+    if RISK_FLAG_COL in styles:
+        base_idx = int(styles[RISK_FLAG_COL])
+        for flag, (fill_rgb, font_rgb) in RISK_FLAG_COLORS.items():
+            flag_styles[flag] = _add_fill_variant(editor, base_idx,
+                                                  fill_rgb, font_rgb)
+
     parts = []
     for offset, bond in enumerate(bond_rows):
         row_num = start_row + offset
@@ -789,7 +815,12 @@ def _build_bondlist_rows_xml(editor: _XlsxEditor, bond_rows, data, schema,
         for col_idx, val in enumerate(values, start=1):
             col = _col_letter(col_idx)
             ref = f'{col}{row_num}'
-            style_attr = f' s="{styles[col]}"' if col in styles else ''
+            if col == RISK_FLAG_COL and flag_styles:
+                flag = str(val).strip().upper() if val is not None else '-'
+                s_idx = flag_styles.get(flag, flag_styles['-'])
+                style_attr = f' s="{s_idx}"'
+            else:
+                style_attr = f' s="{styles[col]}"' if col in styles else ''
             if val is None:
                 cells_xml.append(f'<c r="{ref}"{style_attr}/>')
             elif isinstance(val, datetime.datetime) or isinstance(val, datetime.date):
@@ -830,6 +861,12 @@ def _add_nonbold_variant(editor: _XlsxEditor, source_style_idx: int) -> str:
     new_font = etree.fromstring(etree.tostring(src_font))
     for b in new_font.findall('m:b', NSMAP):
         new_font.remove(b)
+        # Force a visible (black) font colour — the template's placeholder
+        # style carries a white/invisible colour, which made the populated
+        # 'Changes this week' rows unreadable.
+        for c in new_font.findall('m:color', NSMAP):
+           c.attrib.clear()
+           c.set('rgb', 'FF000000')
     fonts.append(new_font)
     fonts.set('count', str(len(fonts.findall('m:font', NSMAP))))
     new_font_id = len(fonts.findall('m:font', NSMAP)) - 1
@@ -838,6 +875,10 @@ def _add_nonbold_variant(editor: _XlsxEditor, source_style_idx: int) -> str:
     new_xf = etree.fromstring(etree.tostring(src_xf))
     new_xf.set('fontId', str(new_font_id))
     new_xf.set('applyFont', '1')
+    # Force NO fill (white). The template's source style carries a gray fill,
+    # which made the Changes-this-week rows look gray instead of white.
+    new_xf.set('fillId', '0')
+    new_xf.set('applyFill', '1')
     cxfs.append(new_xf)
     cxfs.set('count', str(len(cxfs.findall('m:xf', NSMAP))))
     new_idx = len(cxfs.findall('m:xf', NSMAP)) - 1
@@ -845,6 +886,78 @@ def _add_nonbold_variant(editor: _XlsxEditor, source_style_idx: int) -> str:
     editor.files['xl/styles.xml'] = etree.tostring(
         root, xml_declaration=True, encoding='UTF-8', standalone=True)
     return str(new_idx)
+
+
+def _add_fill_variant(editor: _XlsxEditor, source_style_idx: int,
+                      fill_rgb, font_rgb) -> str:
+    """Clone an existing cellXfs style with a different solid fill and font
+    colour. Returns the new style index as a string. `fill_rgb` None means
+    no fill (patternType="none"). Colours are 'RRGGBB' hex strings.
+    Everything else (borders, alignment, number format, font face/size) is
+    kept, so the cell still looks like the template row — only the colour
+    changes. Results are memoised on the editor so each variant is added
+    to styles.xml once per workbook."""
+    if 'xl/styles.xml' not in editor.files:
+        return str(source_style_idx)
+    cache = editor.__dict__.setdefault('_fill_variant_cache', {})
+    key = (source_style_idx, fill_rgb, font_rgb)
+    if key in cache:
+        return cache[key]
+
+    root = etree.fromstring(editor.files['xl/styles.xml'])
+    cxfs = root.find('m:cellXfs', NSMAP)
+    all_xfs = cxfs.findall('m:xf', NSMAP)
+    if source_style_idx >= len(all_xfs):
+        return str(source_style_idx)
+    src_xf = all_xfs[source_style_idx]
+
+    # ---- fill -------------------------------------------------------------
+    fills = root.find('m:fills', NSMAP)
+    if fill_rgb:
+        new_fill = etree.SubElement(fills, f'{{{NS_MAIN}}}fill')
+        pf = etree.SubElement(new_fill, f'{{{NS_MAIN}}}patternFill',
+                              patternType='solid')
+        etree.SubElement(pf, f'{{{NS_MAIN}}}fgColor', rgb='FF' + fill_rgb.upper())
+        etree.SubElement(pf, f'{{{NS_MAIN}}}bgColor', indexed='64')
+        fill_id = len(fills.findall('m:fill', NSMAP)) - 1
+    else:
+        fill_id = 0   # fill index 0 is always patternType="none" per the spec
+    fills.set('count', str(len(fills.findall('m:fill', NSMAP))))
+
+    # ---- font (clone the source font, swap its colour) --------------------
+    fonts = root.find('m:fonts', NSMAP)
+    all_fonts = fonts.findall('m:font', NSMAP)
+    src_font_id = int(src_xf.get('fontId', 0))
+    src_font = all_fonts[src_font_id] if src_font_id < len(all_fonts) else all_fonts[0]
+    new_font = etree.fromstring(etree.tostring(src_font))
+    for c in new_font.findall('m:color', NSMAP):
+        new_font.remove(c)
+    color_el = etree.Element(f'{{{NS_MAIN}}}color', rgb='FF' + font_rgb.upper())
+    # CT_Font is an ordered sequence: colour goes before name/family/charset/scheme
+    insert_at = len(new_font)
+    for i, child in enumerate(new_font):
+        if etree.QName(child).localname in ('name', 'family', 'charset', 'scheme'):
+            insert_at = i
+            break
+    new_font.insert(insert_at, color_el)
+    fonts.append(new_font)
+    fonts.set('count', str(len(fonts.findall('m:font', NSMAP))))
+    font_id = len(fonts.findall('m:font', NSMAP)) - 1
+
+    # ---- xf ---------------------------------------------------------------
+    new_xf = etree.fromstring(etree.tostring(src_xf))
+    new_xf.set('fillId', str(fill_id))
+    new_xf.set('applyFill', '1')
+    new_xf.set('fontId', str(font_id))
+    new_xf.set('applyFont', '1')
+    cxfs.append(new_xf)
+    cxfs.set('count', str(len(cxfs.findall('m:xf', NSMAP))))
+    new_idx = str(len(cxfs.findall('m:xf', NSMAP)) - 1)
+
+    editor.files['xl/styles.xml'] = etree.tostring(
+        root, xml_declaration=True, encoding='UTF-8', standalone=True)
+    cache[key] = new_idx
+    return new_idx
 
 
 def _find_or_create_date_style(editor: _XlsxEditor):
@@ -935,8 +1048,11 @@ def _build_changes_rows_xml(editor: _XlsxEditor, changes,
     # non-bold variants so the rows look like regular readable text.
     S_SECTION_LABEL = '184'   # gray-bar bold label — keep bold for headers
     S_SECTION_FILL  = '108'   # gray empty cell across the rest of the row
-    S_DATA_LABEL    = '185'   # empty left-gutter cell on data rows
-    S_DATA_FILL     = '178'   # empty-looking cell in the left-gutter columns
+    # 185/178 are the template's placeholder gutter styles, which carry a red
+    # fill (the red blocks on the left of the data rows). Reuse the clean
+    # white data style instead so the left gutter has no colour.
+    S_DATA_LABEL    = _add_nonbold_variant(editor, 198)
+    S_DATA_FILL     = _add_nonbold_variant(editor, 198)
     S_DATA_VALUE    = _add_nonbold_variant(editor, 198)   # non-bold version
     S_DATA_DATE     = _add_nonbold_variant(editor, 199)   # non-bold date style
 
@@ -994,7 +1110,7 @@ def _build_changes_rows_xml(editor: _XlsxEditor, changes,
                 coupon_val = None
             if coupon_val is not None:
                 cells.append(
-                    f'<c r="H{row_num}" s="{S_DATA_VALUE}"><v>{coupon_val}</v></c>')
+                    f'<c r="H{row_num}" s="{S_DATA_VALUE}" t="s"><v>{editor.add_string(itm["coupon"])}</v></c>')
             else:
                 cells.append(f'<c r="H{row_num}" s="{S_DATA_VALUE}"/>')
             cells.append(f'<c r="I{row_num}" s="{S_DATA_VALUE}"/>')
@@ -1090,7 +1206,7 @@ def build_onshore_xlsx(data, output_path, template_path=DEFAULT_ONSHORE_TEMPLATE
     # Onshore's Cover sheet has an extra 'ab' text in cell B1 (a second
     # fallback rendering of the UBS logo, this time via cell content not
     # a drawing). Overwrite it with 'UBS'.
-    _set_cell_inline(editor, 'Cover', 1, 2, 'UBS')
+    #_set_cell_inline(editor, 'Cover', 1, 2, 'UBS')
 
     # BondList
     def _issuer_maturity_sort_key(bond):
