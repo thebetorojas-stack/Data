@@ -116,6 +116,20 @@ UST10Y_NOW: Optional[float] = 4.80
 CURVE_BETA = 1.0
 SENSITIVITY_UST = [-100, -75, -50, -25, 0, 25, 50, 75, 100]   # kept for grid B
 SENSITIVITY_SPREADS = [125, 150, 175, 200, 225, 250, 275]
+SCENARIO_SPREADS = [125, 150, 175, 200, 225, 250, 275, 300]   # rows of the scenario grid
+# Bear / base / bull defaults for the Forecast tab. Every one of these is an input cell
+# in the workbook; change them there, not here. "spread" is the level you actually want
+# to argue (blank it in the workbook to let the drivers set it), "prob" the weight.
+SCENARIOS = [
+    ("Bear", dict(ust=50,  dxy=5.0,  vix=8.0,  rating=-0.25, spread=250, prob=25)),
+    ("Base", dict(ust=-20, dxy=0.0,  vix=0.0,  rating=0.0,   spread=175, prob=50)),
+    ("Bull", dict(ust=-50, dxy=-3.0, vix=-4.0, rating=0.25,  spread=150, prob=25)),
+]
+DISTRESSED_YIELD = 15.0     # above this a yield is a recovery bet, not a carry estimate
+MAX_BREAK_DAYS = 24         # more break days than this and the name trades on price, not spread
+SCN_COL = {"Bear": "I", "Base": "J", "Bull": "K"}      # fixed columns on the Forecast tab
+SCN_ROW_UST, SCN_ROW_CHG = 6, 13                       # fixed rows: UST change, spread change
+GRID_MARGIN_PP = 1.0        # within this of cash the cell is "marginal" (grey), not ok / not ok
 
 # A duration approximation is a first-order expansion: it is accurate for small
 # moves and fails badly for large ones, because duration itself changes as the
@@ -168,8 +182,13 @@ SNAP_EXTRA_FIELDS = [
     "MTD Change (%)", "No. of Issues", "No. of Issuer",
     "Average S&P Rating", "Average Moody Rating", "Average Fitch Rating",
 ]
+# Only DIVERSIFIED is accepted. Plain "EMBI Global" is a different index with
+# different weights and a different level - Latin prints 939 on it against
+# 1084 on Diversified for the same day - and letting one in produces a fake
+# +15.7% "return". It is rejected at the gate, never mapped.
+ACCEPTED_INDEX_LABELS = {"embi global diversified", "embig div"}
 SNAP_ENTITY_MAP = {
-    "embi global diversified": INDEX, "embi global": INDEX, "embig div": INDEX,
+    "embi global diversified": INDEX, "embig div": INDEX,
     "africa": "AFRICA Region", "asia": "ASIA Region", "europe": "EUROPE Region",
     "latin": "LATIN Region", "middle east": "MIDEAST Region",
     "investment grade": "Credit IG only", "non investment grade": "Credit Non-IG",
@@ -187,6 +206,8 @@ FN = "Arial"
 C_HDR, C_HDRFG = "002B5C", "FFFFFF"      # UBS-style deep blue header
 C_BAND = "DCE3EC"                         # pale blue section band
 C_GOOD, C_BAD = "EDF2F8", "FBE7E9"        # pale blue / pale red, no green
+C_OK, C_MARG, C_NOTOK = "C9D9EE", "E3E3E3", "F2C4C9"   # scenario grid: ok / marginal / not ok
+C_OKTXT, C_NOTOKTXT = "002B5C", "9C0A1E"
 C_IN, C_BRD = "E8EEF5", "BFBFBF"          # inputs shaded blue, not yellow
 C_HARD, C_TXT, C_NOTE = "0033A0", "000000", "6E6E6E"
 BRD = Border(*[Side(style="thin", color=C_BRD)] * 4)
@@ -384,8 +405,23 @@ class Panel:
                 date = to_date(r.get("Date"))
             key = inst.lower()
             if first:
-                ent = INDEX          # the first data row is always the index
                 first = False
+                # ---- THE GATE ----
+                if key not in ACCEPTED_INDEX_LABELS:
+                    print(f"REJECTED : {path.name} is '{inst}', not EMBI Global Diversified. "
+                          f"Not ingested. Remove it from the folder.", file=sys.stderr)
+                    return None
+                # Same date already in the history? The index level must agree.
+                # If it does not, this file is a different index wearing the
+                # right label, and it must not overwrite anything.
+                lvl = num(r.get("Index Level"))
+                have = self.data.get(date or "", {}).get((INDEX, M_TRI))
+                if lvl is not None and have is not None and abs(lvl / have - 1.0) > 0.005:
+                    print(f"REJECTED : {path.name} index level {lvl:.2f} disagrees with the "
+                          f"history's {have:.2f} on {date} by {abs(lvl / have - 1) * 100:.1f}%. "
+                          f"Different index. Not ingested.", file=sys.stderr)
+                    return None
+                ent = INDEX
             elif key in SNAP_ENTITY_MAP:
                 ent = SNAP_ENTITY_MAP[key]
             elif key in SKIP_INSTRUMENTS:
@@ -476,27 +512,55 @@ class Panel:
     def ir_duration(self, d: str, e: str) -> float:
         return self.nearest_extra(d, e, "IR Duration to Worst") or DEFAULT_IR_DURATION
 
+    def spread_meaningful(self, e: str) -> bool:
+        """False for names whose spread series steps constantly — defaulted or deeply
+        distressed paper that trades on price. Their spread changes are not reported."""
+        return len(self.breaks_for(e)) <= MAX_BREAK_DAYS
+
+    def breaks_for(self, e: str) -> Dict[str, Dict[str, Any]]:
+        """Basis-break days for this sub-index, detected on its own series and cached."""
+        cache = self.__dict__.setdefault("_breaks_by_entity", {})
+        if e not in cache:
+            cache[e] = detect_breaks(self, e)
+        return cache[e]
+
 
 # ===========================================================================
 # ANALYTICS
 # ===========================================================================
 
-def detect_breaks(panel: "Panel") -> Dict[str, Dict[str, Any]]:
-    """Days where the spread series steps but the return series does not."""
+def detect_breaks(panel: "Panel", e: str = INDEX) -> Dict[str, Dict[str, Any]]:
+    """Days where a sub-index's spread (and yield) series steps but its return series
+    does not — a composition or methodology change, not the market. Run per entity:
+    the Middle East steps at month-ends as Lebanon's weight is rebalanced, and the
+    index-level detector never sees it.
+
+    A day is a break when the return the yield move implies (minus duration times
+    the move) is more than BREAK_MIN_GAP_PP away from the actual return AND the gap
+    is most of the implied move, so a distressed name's convexity noise on a real
+    move is not mistaken for a break."""
     out: Dict[str, Dict[str, Any]] = {}
     ds = panel.dates()
+    dur, _src = panel.duration(ds[-1], e) if ds else (DEFAULT_DURATION, "default")
     for i in range(1, len(ds)):
         d0, d1 = ds[i - 1], ds[i]
-        s0, s1 = panel.get(d0, INDEX, M_STW), panel.get(d1, INDEX, M_STW)
-        t0, t1 = panel.get(d0, INDEX, M_TRI), panel.get(d1, INDEX, M_TRI)
+        s0, s1 = panel.get(d0, e, M_STW), panel.get(d1, e, M_STW)
+        t0, t1 = panel.get(d0, e, M_TRI), panel.get(d1, e, M_TRI)
         if None in (s0, s1, t0, t1) or not t0:
             continue
         jump = s1 - s0
         if abs(jump) < BREAK_MIN_BP:
             continue
         actual = (t1 / t0 - 1.0) * 100.0
-        implied = -DEFAULT_DURATION * jump / 100.0
-        if abs(actual - implied) > BREAK_MIN_GAP_PP:
+        # Test the return against the YIELD move, not the spread move: on a day when
+        # spreads widen 29bp while Treasuries rally 22bp (28-Sep-2022) the return is
+        # flat for a market reason, and calling that a basis break would drop a real
+        # move from every window that crosses it.
+        y0, y1 = panel.get(d0, e, M_YLD), panel.get(d1, e, M_YLD)
+        move = (y1 - y0) * 100.0 if None not in (y0, y1) else jump
+        implied = -dur * move / 100.0
+        gap = abs(actual - implied)
+        if gap > BREAK_MIN_GAP_PP and gap > 0.6 * abs(implied):
             out[d1] = {"jump_bp": jump, "actual_pct": actual, "implied_pct": implied}
     return out
 
@@ -514,6 +578,7 @@ def chain_change(panel: "Panel", e: str, metric: str, d0: Optional[str], d1: str
     naive = None
     if v0 is not None and v1 is not None:
         naive = (v1 / v0 - 1.0) * 100.0 if metric == M_TRI else (v1 - v0) * scale
+    breaks = panel.breaks_for(e)          # the entity's own break days, not the index's
     window = [d for d in panel.dates() if d0 <= d <= d1]
     crossed = any(d in breaks for d in window[1:])
     if metric == M_TRI or not crossed:
@@ -569,6 +634,13 @@ def attribute(panel: Panel, e: str, d0: str, d1: str) -> Optional[Dict[str, Any]
     breaks = getattr(panel, "_breaks", {}) or {}
     chained, naive, crossed = chain_change(panel, e, M_STW, d0, d1, breaks)
     move = chained if chained is not None else (s1 - s0)
+    if not panel.spread_meaningful(e):
+        out["spread_bp"] = None
+        out["spread_bp_naive"] = naive
+        out["crossed_break"] = crossed
+        out["dur"], out["dur_src"] = D, src
+        out["flag"] = "spread not meaningful — trades on price (defaulted / distressed)"
+        return out
     out["spread_bp"] = move
     out["spread_bp_naive"] = naive
     out["crossed_break"] = crossed
@@ -653,9 +725,134 @@ def ust_levels(now: float, span: float = 1.0, step: float = 0.25) -> List[float]
     return out
 
 
+def chained_series(panel: Panel, e: str, metric: str, breaks: Dict[str, Any]) -> Dict[str, float]:
+    """The spread history restated on today's basis: start from today's published level
+    and walk back with the chain-linked daily moves, so every basis-break step is removed.
+    The steps are removed proportionally (each day's ratio, not its difference): the
+    defaulted names that JPM took out on 04-Sep contributed far more basis points when
+    spreads were wide in 2022 than they do today, and a proportional restatement respects
+    that; a fixed-bp restatement drives some regional histories negative. Still an
+    approximation — see break_share() for how much of a segment's level the steps were."""
+    ser = panel.series(e, metric)
+    breaks = panel.breaks_for(e)
+    if not ser:
+        return {}
+    out = {ser[-1][0]: ser[-1][1]}
+    lvl = ser[-1][1]
+    for i in range(len(ser) - 1, 0, -1):
+        d, v = ser[i]
+        dp, vp = ser[i - 1]
+        if d not in breaks and v and vp and v > 0 and vp > 0:
+            lvl *= vp / v
+        out[dp] = lvl
+    return out
+
+
+def break_share(panel: Panel, e: str, breaks: Dict[str, Any] = None) -> float:
+    """How much of the segment's spread history has been restated: the sum over its
+    break days of |step| / level before the step. Above ~0.5 the composition changed
+    too much for the restated history to be more than indicative."""
+    ser = panel.series(e, M_STW)
+    brk = panel.breaks_for(e)
+    tot = 0.0
+    for i in range(1, len(ser)):
+        if ser[i][0] in brk and ser[i - 1][1]:
+            tot += abs(ser[i][1] - ser[i - 1][1]) / abs(ser[i - 1][1])
+    return tot
+
+
+def pctl(vals: Sequence[float], q: float) -> Optional[float]:
+    """Linear-interpolated percentile, q in [0, 1]."""
+    xs = sorted(v for v in vals if v is not None)
+    if not xs:
+        return None
+    if len(xs) == 1:
+        return xs[0]
+    pos = q * (len(xs) - 1)
+    lo, hi = int(math.floor(pos)), int(math.ceil(pos))
+    return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def pct_rank(vals: Sequence[float], x: float) -> Optional[float]:
+    xs = [v for v in vals if v is not None]
+    if not xs:
+        return None
+    return 100.0 * sum(1 for v in xs if v <= x) / len(xs)
+
+
+def rolling_12m_returns(panel: Panel, e: str = INDEX, obs: int = 252) -> List[Tuple[str, float]]:
+    """(start date, total return % over the following ~12 months) for every start."""
+    ser = panel.series(e, M_TRI)
+    return [(ser[i - obs][0], (ser[i][1] / ser[i - obs][1] - 1.0) * 100.0)
+            for i in range(obs, len(ser)) if ser[i - obs][1]]
+
+
+def worst_drawdowns(panel: Panel, e: str = INDEX, n: int = 3) -> List[Dict[str, Any]]:
+    """The n deepest peak-to-trough falls in the total return index, with recovery dates."""
+    ser = panel.series(e, M_TRI)
+    if len(ser) < 2:
+        return []
+    episodes: List[Dict[str, Any]] = []
+    peak_d, peak_v = ser[0]
+    trough_d, trough_v = ser[0]
+    in_dd = False
+    for d, v in ser[1:]:
+        if v >= peak_v:
+            if in_dd:
+                episodes.append(dict(peak=peak_d, trough=trough_d, recovered=d,
+                                     depth=(trough_v / peak_v - 1.0) * 100.0,
+                                     days_down=(dt(trough_d) - dt(peak_d)).days,
+                                     days_back=(dt(d) - dt(trough_d)).days))
+                in_dd = False
+            peak_d, peak_v = d, v
+            trough_d, trough_v = d, v
+        else:
+            in_dd = True
+            if v < trough_v:
+                trough_d, trough_v = d, v
+    if in_dd:
+        episodes.append(dict(peak=peak_d, trough=trough_d, recovered=None,
+                             depth=(trough_v / peak_v - 1.0) * 100.0,
+                             days_down=(dt(trough_d) - dt(peak_d)).days, days_back=None))
+    episodes.sort(key=lambda x: x["depth"])
+    return episodes[:n]
+
+
 def total_return(yld: float, ir_dur: float, spr_dur: float,
                  d_ust_bp: float, spread_now: float, spread_fcst: float) -> float:
     return yld - ir_dur * (d_ust_bp / 100.0) - spr_dur * ((spread_fcst - spread_now) / 100.0)
+
+
+def scenario_grid(dash: "Dashboard"):
+    """12m total return at every (spread level, US 10y level) pair. Spread and rates are set
+    independently here — no beta — so the reader sees the raw arithmetic. Returns
+    (levels, rows) where rows is a list of (label, spread_bp, [tr per level]). The first row
+    is the spot spread so the reader can find today on the grid."""
+    levels = list(dash.ust_grid)
+    if all(abs(l - dash.ust10y) > 0.005 for l in levels):
+        levels = sorted(levels + [dash.ust10y])       # the spot 10y gets its own column
+    spreads = [("Spot %.0fbp" % dash.spread, dash.spread)] + \
+              [("%dbp" % s, float(s)) for s in SCENARIO_SPREADS]
+    rows = []
+    for lab, s_ in spreads:
+        vals = []
+        for lvl in levels:
+            u = (lvl - dash.ust10y) * 100.0
+            anchor = lvl + dash.term_premium + (CURVE_BETA - 1.0) * u / 100.0
+            du = (anchor - dash.ust_now) * 100.0
+            vals.append(total_return(dash.yld, dash.IRD, dash.D, du, dash.spread, s_))
+        rows.append((lab, s_, vals))
+    return levels, rows
+
+
+def grid_verdict(tr: float) -> str:
+    """'ok' clears cash by GRID_MARGIN_PP or more, 'marginal' is within the margin either
+    side of cash, 'bad' is below cash by more than the margin."""
+    if tr >= CASH_RATE + GRID_MARGIN_PP:
+        return "ok"
+    if tr >= CASH_RATE - GRID_MARGIN_PP:
+        return "marginal"
+    return "bad"
 
 
 # ===========================================================================
@@ -920,6 +1117,9 @@ class Dashboard:
         d_1m, d_3m, d_12m = self._back(1), self._back(3), self._back(12)
         left = [("Sub-index", 30), (f"Latest ({unit})", 14), ("1 month", 11),
                 ("3 months", 11), (f"YTD {self.year}", 12), ("12 months", 11)]
+        scn = metric == M_TRI
+        if scn:
+            left += [(f"{n} 12m %\n(Forecast tab)", 12) for n, _s in SCENARIOS]
         hr = 4
         for i, (h, w) in enumerate(left, start=1):
             H(ws.cell(row=hr, column=i), h)
@@ -946,11 +1146,29 @@ class Dashboard:
                 V(ws.cell(row=r, column=2), self.p.get(self.d1, e, metric),
                   fmt=level_fmt, color=C_HARD, bold=is_agg)
                 for k, dd in enumerate([d_1m, d_3m, self.d0, d_12m], start=3):
-                    val = self._chg(e, metric, dd, self.d1)
+                    val = (self._chg(e, metric, dd, self.d1)
+                           if metric == M_TRI or self.p.spread_meaningful(e) else None)
                     cell = V(ws.cell(row=r, column=k), val, fmt=chg_fmt, bold=is_agg)
                     if val is not None and abs(val) > 1e-9:
                         good = (val > 0) if metric == M_TRI else (val < 0)
                         cell.fill = PatternFill("solid", fgColor=C_GOOD if good else C_BAD)
+                if scn:
+                    y_ = self.p.get(self.d1, e, M_YLD)
+                    s_ = self.p.get(self.d1, e, M_STW)
+                    D_, _src = self.p.duration(self.d1, e)
+                    IRD_ = self.p.ir_duration(self.d1, e)
+                    for k, (n_, _s) in enumerate(SCENARIOS):
+                        cell = ws.cell(row=r, column=7 + k)
+                        if y_ is None or s_ is None or y_ > DISTRESSED_YIELD or not self.spread:
+                            V(cell, None, fmt="0.00")
+                            continue
+                        col = SCN_COL[n_]
+                        # own yield, own durations; the index's spread change scaled by
+                        # this sub-index's spread relative to the index (proportional beta)
+                        f_ = (f"={y_:.4f}-{IRD_:.4f}*Forecast!${col}${SCN_ROW_UST}/100"
+                              f"-{D_:.4f}*(Forecast!${col}${SCN_ROW_CHG}*{s_:.2f}/{self.spread:.2f})/100")
+                        V(cell, None, fmt="0.00", bold=is_agg, color=C_HARD)
+                        cell.value = f_
                 for j, d in enumerate(picks, start=len(left) + 1):
                     V(ws.cell(row=r, column=j), self.p.get(d, e, metric),
                       fmt=level_fmt, color=C_HARD)
@@ -962,6 +1180,21 @@ class Dashboard:
                 else "Green is tightening, red is widening.")
         ws.cell(row=r, column=1, value=note + "  Levels in the history block are month ends.")
         F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+        if scn:
+            r += 1
+            ws.cell(row=r, column=1, value=(
+                "Scenario columns are live formulas on the Forecast tab's bear/base/bull inputs: each "
+                "sub-index uses its own yield and durations, and takes the index spread change scaled by "
+                "its own spread relative to the index (a 100bp index widening is 55bp for a 96bp IG bucket "
+                "and 190bp for a 330bp B bucket). Blank where the yield is above "
+                f"{DISTRESSED_YIELD:.0f}% — that is a recovery bet, not carry."))
+            F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+            from openpyxl.formatting.rule import CellIsRule
+            rng = f"G5:I{r}"
+            ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThanOrEqual", formula=[str(CASH_RATE)],
+                                                          fill=PatternFill("solid", fgColor=C_OK)))
+            ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=[str(CASH_RATE)],
+                                                          fill=PatternFill("solid", fgColor=C_NOTOK)))
 
     def spreads_tab(self):
         self._metric_tab("Spreads", M_STW, "Spreads — STW over Treasury", "bp", "0", "+0;-0")
@@ -971,6 +1204,33 @@ class Dashboard:
 
     def total_return_tab(self):
         self._metric_tab("Total_Return", M_TRI, "Total return index", "level", "0.00", "+0.00;-0.00")
+
+    def _breaks_by_entity_block(self, ws, r: int) -> int:
+        r = band(ws, r, 5, "Break days by sub-index — each series is tested on its own")
+        for i, h in enumerate(["Sub-index", "Break days", "Last break", "Step that day (bp)",
+                               "Restated share of level"], start=1):
+            H(ws.cell(row=r, column=i), h)
+        r += 1
+        for e in [INDEX] + REGIONS + RATINGS + self.countries:
+            b = self.p.breaks_for(e)
+            if not b:
+                continue
+            last = sorted(b)[-1]
+            L(ws.cell(row=r, column=1), e, bold=e == INDEX or e in REGIONS or e in RATINGS)
+            V(ws.cell(row=r, column=2), len(b), fmt="0")
+            V(ws.cell(row=r, column=3), last, fmt="@")
+            V(ws.cell(row=r, column=4), b[last]["jump_bp"], fmt="+0;-0", color=C_HARD)
+            sh = break_share(self.p, e)
+            V(ws.cell(row=r, column=5), sh, fmt="0%", color=C_NOTOKTXT if sh > 0.5 else C_TXT)
+            r += 1
+        r += 1
+        ws.cell(row=r, column=1, value=(
+            "Every chain-linked spread change in this workbook skips that sub-index's own break days. "
+            "The Middle East steps at month-ends as Lebanon is rebalanced; Latin America stepped when "
+            "Venezuela was re-admitted in April 2024 and again when defaulted names left the spread on "
+            "04-Sep-2026. None of those days is a market move."))
+        F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+        return r
 
     # ---------- forecast ----------
     def forecast(self):
@@ -1082,6 +1342,91 @@ class Dashboard:
             F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
             r += 1
 
+        self._forecast_scenarios(ws, first, last)
+
+    def _forecast_scenarios(self, ws, first: int, last: int) -> None:
+        """Bear / base / bull side by side, to the right of the single-case plug. Live
+        formulas: the betas are the same cells the central case uses, the spread can be
+        set directly or left to the drivers, and the probability weights give an expected
+        value. The Total_Return tab's scenario columns point at rows 6 and 13 here."""
+        for c in "HIJKL":
+            ws.column_dimensions[c].width = 15
+        ws.column_dimensions["H"].width = 34
+        cols = [SCN_COL[n] for n, _s in SCENARIOS]
+        # band H4:L4
+        L(ws["H4"], "12-month scenarios — bear / base / bull (shaded cells are yours)", fill=C_BAND)
+        for c in "IJKL":
+            ws[f"{c}4"].fill = PatternFill("solid", fgColor=C_BAND); ws[f"{c}4"].border = BRD
+        H(ws["H5"], "")
+        for (name, _s), c in zip(SCENARIOS, cols):
+            H(ws[f"{c}5"], name)
+        H(ws["L5"], "Prob-weighted")
+        beta_rows = list(range(first, last + 1))      # UST, DXY, VIX, rating — same order
+        drivers = [("UST 10y change (bp)", "ust", "+0;-0"), ("DXY change (%)", "dxy", "+0.0;-0.0"),
+                   ("VIX change (points)", "vix", "+0.0;-0.0"),
+                   ("EM rating drift (notches)", "rating", "+0.00;-0.00")]
+        for k, (lbl, key, fmt) in enumerate(drivers):
+            rr = 6 + k
+            L(ws[f"H{rr}"], lbl, bold=False)
+            for (name, s), c in zip(SCENARIOS, cols):
+                V(ws[f"{c}{rr}"], s[key], fmt=fmt, fill=C_IN, bold=True)
+            f_ = f"=SUMPRODUCT(I{rr}:K{rr},$I$16:$K$16)/SUM($I$16:$K$16)"
+            V(ws[f"L{rr}"], None, fmt=fmt, color=C_NOTE); ws[f"L{rr}"].value = f_
+        L(ws["H10"], "Spread from the drivers (bp)", bold=False)
+        for c in cols:
+            f_ = "=$B$5+" + "+".join(f"{c}{6 + k}*$C${beta_rows[k]}" for k in range(4))
+            V(ws[f"{c}10"], None, fmt="0", color=C_NOTE); ws[f"{c}10"].value = f_
+        L(ws["H11"], "Spread you want to argue (bp; blank = drivers)", bold=False)
+        for (name, s), c in zip(SCENARIOS, cols):
+            V(ws[f"{c}11"], s["spread"], fmt="0", fill=C_IN, bold=True)
+        L(ws["H12"], "Spread used (bp)", bold=True)
+        for c in cols:
+            f_ = f'=IF({c}11="",{c}10,{c}11)'
+            V(ws[f"{c}12"], None, fmt="0", bold=True, color=C_HARD); ws[f"{c}12"].value = f_
+        f_ = "=SUMPRODUCT(I12:K12,$I$16:$K$16)/SUM($I$16:$K$16)"
+        V(ws["L12"], None, fmt="0", bold=True, color=C_HARD); ws["L12"].value = f_
+        L(ws["H13"], "Change vs today (bp)", bold=False)
+        for c in cols:
+            f_ = f"={c}12-$B$5"
+            V(ws[f"{c}13"], None, fmt="+0;-0"); ws[f"{c}13"].value = f_
+        L(ws["H14"], "12m total return (%)", bold=True)
+        for c in cols:
+            f_ = f"=$B$6-$B$8*{c}6/100-$B$7*{c}13/100"
+            V(ws[f"{c}14"], None, fmt="0.00", bold=True, color=C_HARD); ws[f"{c}14"].value = f_
+        f_ = "=SUMPRODUCT(I14:K14,$I$16:$K$16)/SUM($I$16:$K$16)"
+        V(ws["L14"], None, fmt="0.00", bold=True, color=C_HARD); ws["L14"].value = f_
+        L(ws["H15"], "Excess over cash (pp)", bold=False)
+        for c in cols + ["L"]:
+            f_ = f"={c}14-$B$9"
+            V(ws[f"{c}15"], None, fmt="+0.00;-0.00"); ws[f"{c}15"].value = f_
+        L(ws["H16"], "Probability (%)", bold=False)
+        for (name, s), c in zip(SCENARIOS, cols):
+            V(ws[f"{c}16"], s["prob"], fmt="0", fill=C_IN, bold=True)
+        V(ws["L16"], None, fmt="0", color=C_NOTE); ws["L16"].value = "=SUM(I16:K16)"
+        L(ws["H17"], "Spread at which return = cash (bp)", bold=False)
+        for c in cols:
+            f_ = f"=$B$5+($B$6-$B$8*{c}6/100-$B$9)*100/$B$7"
+            V(ws[f"{c}17"], None, fmt="0", color=C_HARD); ws[f"{c}17"].value = f_
+        # Excel-native conditional colour so the cells recolour as the inputs change.
+        from openpyxl.formatting.rule import CellIsRule
+        ws.conditional_formatting.add("I14:L14", CellIsRule(operator="greaterThanOrEqual", formula=["$B$9"],
+                                                             fill=PatternFill("solid", fgColor=C_OK)))
+        ws.conditional_formatting.add("I14:L14", CellIsRule(operator="lessThan", formula=["$B$9"],
+                                                             fill=PatternFill("solid", fgColor=C_NOTOK)))
+        from openpyxl.chart import BarChart
+        ch = BarChart()
+        ch.type = "col"
+        ch.title = "12m total return by scenario (%)"
+        ch.add_data(Reference(ws, min_col=9, max_col=11, min_row=14, max_row=14), from_rows=True, titles_from_data=False)
+        ch.set_categories(Reference(ws, min_col=9, max_col=11, min_row=5, max_row=5))
+        ch.legend = None
+        ch.height, ch.width = 6.5, 11
+        ws.add_chart(ch, "H19")
+        ws["H33"] = ("The base case is the spread you defend, the bear case is the official number, the bull "
+                     "case is what a Treasury rally does. Change any shaded cell; the Total_Return tab's "
+                     "scenario columns and the probability-weighted column follow.")
+        F(ws["H33"], italic=True, color=C_NOTE)
+
     # ---------- sensitivity ----------
     def sensitivity(self):
         ws = self.wb.create_sheet("Sensitivity")
@@ -1159,6 +1504,424 @@ class Dashboard:
                                         "decides the call."))
         F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
 
+    # ---------- scenario grid ----------
+    def scenario_tab(self):
+        ws = self.wb.create_sheet("Scenario_Grid")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "Scenario grid — 12-month total return by US 10y level and index spread level"
+        F(ws["A1"], size=14, bold=True, color=C_HDR)
+        ws["A2"] = (f"Spot: spread {self.spread:.0f}bp, yield {self.yld:.2f}%, US 10y "
+                    f"{self.ust10y:.2f}%, spread duration {self.D:.2f}, IR duration {self.IRD:.2f}, "
+                    f"cash {CASH_RATE:.2f}%. Return = yield − IR duration × Δ10y − spread duration "
+                    f"× Δspread, spread and rates set independently.")
+        F(ws["A2"], italic=True, color=C_NOTE)
+        ws["A3"] = (f"Blue: beats cash by {GRID_MARGIN_PP:.1f}pp or more (ok). Grey: within "
+                    f"{GRID_MARGIN_PP:.1f}pp of cash either side (marginal). Red: below cash by "
+                    f"more than {GRID_MARGIN_PP:.1f}pp (not ok). Bold outline marks the spot "
+                    f"10y column; the first row is the spot spread.")
+        F(ws["A3"], italic=True, color=C_NOTE)
+        ws.column_dimensions["A"].width = 18
+        levels, rows = scenario_grid(self)
+        for i in range(2, len(levels) + 3):
+            ws.column_dimensions[get_column_letter(i)].width = 11
+        spot_col = None
+        for j, lvl in enumerate(levels, start=2):
+            if abs(lvl - self.ust10y) <= 0.005:
+                spot_col = j
+        thick = Side(style="medium", color=C_HDR)
+
+        def lvl_label(lvl):
+            return f"{lvl:.2f}%" + (" spot" if abs(lvl - self.ust10y) <= 0.005 else "")
+
+        def grid(r, title, values_fn, fmt):
+            r = band(ws, r, len(levels) + 1, title)
+            H(ws.cell(row=r, column=1), "spread \\ US 10y")
+            for j, lvl in enumerate(levels, start=2):
+                H(ws.cell(row=r, column=j), lvl_label(lvl))
+            r += 1
+            for lab, s_, vals in rows:
+                L(ws.cell(row=r, column=1), lab, bold=lab.startswith("Spot"),
+                  fill=C_BAND if lab.startswith("Spot") else None)
+                for j, tr in enumerate(vals, start=2):
+                    v = grid_verdict(tr)
+                    fill = {"ok": C_OK, "marginal": C_MARG, "bad": C_NOTOK}[v]
+                    col = {"ok": C_OKTXT, "marginal": C_TXT, "bad": C_NOTOKTXT}[v]
+                    c = V(ws.cell(row=r, column=j), values_fn(tr), fmt=fmt, fill=fill,
+                          color=col, bold=(j == spot_col))
+                    if j == spot_col:
+                        c.border = Border(left=thick, right=thick,
+                                          top=Side(style="thin", color=C_BRD),
+                                          bottom=Side(style="thin", color=C_BRD))
+                r += 1
+            return r + 1
+
+        r = grid(5, "A. 12-month total return (%)", lambda t: t, "0.00")
+        r = grid(r, "B. Excess over cash (pp)", lambda t: t - CASH_RATE, "+0.00;-0.00")
+
+        r = band(ws, r, len(levels) + 1, "C. Break-even spread — the level at which the return equals cash")
+        L(ws.cell(row=r, column=1), "US 10y level")
+        for j, lvl in enumerate(levels, start=2):
+            H(ws.cell(row=r, column=j), lvl_label(lvl))
+        r += 1
+        L(ws.cell(row=r, column=1), "break-even (bp)")
+        for j, lvl in enumerate(levels, start=2):
+            u = (lvl - self.ust10y) * 100.0
+            be = self.spread + (self.yld - self.IRD * (u / 100.0) - CASH_RATE) * 100.0 / self.D
+            V(ws.cell(row=r, column=j), be, fmt="0", bold=True, color=C_HARD)
+        r += 1
+        L(ws.cell(row=r, column=1), "room vs spot (bp)")
+        for j, lvl in enumerate(levels, start=2):
+            u = (lvl - self.ust10y) * 100.0
+            be = self.spread + (self.yld - self.IRD * (u / 100.0) - CASH_RATE) * 100.0 / self.D
+            V(ws.cell(row=r, column=j), be - self.spread, fmt="+0;-0")
+        r += 2
+        for line in [
+            "How to read it: pick the 10y level you believe in, read down to the spread you expect, "
+            "and the cell is the 12-month total return. Row C is the spread the index can widen to "
+            "before the call stops beating cash at that 10y level; 'room vs spot' is how many basis "
+            "points of widening that leaves.",
+            "The grid holds spread and rates independent, which is conservative in the bottom-right: "
+            "in a real risk-off the Treasury rally offsets part of the widening. The Sensitivity tab "
+            "links them through the rates beta instead.",
+            "Convexity is ignored; below roughly 50bp of yield change it is worth under 0.05%.",
+        ]:
+            ws.cell(row=r, column=1, value=line)
+            F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+            r += 1
+
+    # ---------- shared data for the new tabs and slides ----------
+    def segments(self) -> List[str]:
+        """Index, regions and the rating buckets that exist today (no countries)."""
+        return [e for e in [INDEX] + REGIONS + RATINGS
+                if self.p.get(self.d1, e, M_YLD) is not None
+                and (e == INDEX or (self.p.get(self.d1, e, M_WGT) or 0) > 0)]
+
+    @staticmethod
+    def short(e: str) -> str:
+        return (e.replace(" Region", "").replace("Credit ", "").replace(" only", "")
+                .replace("EMBIG Div", "EMBIGD"))
+
+    def cushion_rows(self) -> List[Dict[str, Any]]:
+        """How many basis points of widening the next twelve months of carry can absorb
+        before the segment stops beating cash. (yield - cash) / spread duration."""
+        out = []
+        for e in self.segments():
+            y = self.p.get(self.d1, e, M_YLD) or 0.0
+            s = self.p.get(self.d1, e, M_STW) or 0.0
+            D, _src = self.p.duration(self.d1, e)
+            IRD = self.p.ir_duration(self.d1, e)
+            cush = (y - CASH_RATE) * 100.0 / D if D else None
+            cush50 = (y - IRD * 0.5 - CASH_RATE) * 100.0 / D if D else None
+            out.append(dict(e=e, name=self.short(e), wgt=self.p.get(self.d1, e, M_WGT),
+                            yld=y, spread=s, D=D, IRD=IRD, cushion=cush, cushion_up50=cush50,
+                            cushion_pct=(cush / s * 100.0) if (cush is not None and s) else None,
+                            distressed=y > DISTRESSED_YIELD))
+        return out
+
+    def spread_stats(self) -> List[Dict[str, Any]]:
+        """Today's spread against its own restated history: 1y and full-sample range,
+        median, and the percentile today sits at."""
+        d1y = self._back(12)
+        out = []
+        for e in self.segments():
+            cs = chained_series(self.p, e, M_STW, self.breaks)
+            if len(cs) < 60:
+                continue
+            allv = list(cs.values())
+            y1 = [v for d, v in cs.items() if d1y and d >= d1y]
+            now = self.p.get(self.d1, e, M_STW)
+            share = break_share(self.p, e, self.breaks)
+            out.append(dict(e=e, name=self.short(e), now=now, n_days=len(allv), share=share,
+                            indicative=share > 0.5,
+                            since=min(cs), lo=min(allv), p25=pctl(allv, 0.25),
+                            med=pctl(allv, 0.5), p75=pctl(allv, 0.75), hi=max(allv),
+                            lo1y=min(y1) if y1 else None, hi1y=max(y1) if y1 else None,
+                            rank=pct_rank(allv, now) if now is not None else None))
+        return out
+
+    def return_stats(self) -> Dict[str, Any]:
+        rr = rolling_12m_returns(self.p, INDEX)
+        vals = [v for _d, v in rr]
+        if not vals:
+            return {}
+        lo, hi = math.floor(min(vals) / 2.0) * 2, math.ceil(max(vals) / 2.0) * 2
+        buckets = []
+        x = lo
+        while x < hi:
+            buckets.append((x, sum(1 for v in vals if x <= v < x + 2)))
+            x += 2
+        return dict(n=len(vals), first=rr[0][0], last=rr[-1][0],
+                    p10=pctl(vals, 0.10), p25=pctl(vals, 0.25), med=pctl(vals, 0.5),
+                    p75=pctl(vals, 0.75), p90=pctl(vals, 0.90), lo=min(vals), hi=max(vals),
+                    lo_start=min(rr, key=lambda t: t[1])[0], hi_start=max(rr, key=lambda t: t[1])[0],
+                    beat_cash=100.0 * sum(1 for v in vals if v > CASH_RATE) / len(vals),
+                    negative=100.0 * sum(1 for v in vals if v < 0) / len(vals),
+                    buckets=buckets, drawdowns=worst_drawdowns(self.p, INDEX, 3),
+                    latest=self._chg(INDEX, M_TRI, self._back(12), self.d1))
+
+    def jpm_legs(self) -> List[Dict[str, Any]]:
+        """JPM's own YTD decomposition from the latest snapshot, if one is within a week
+        of the last date: total = (1 + excess over Treasuries) x (1 + Treasury return) - 1."""
+        cands = [(abs((dt(k) - dt(self.d1)).days), k) for k in self.p.extras]
+        if not cands or min(cands)[0] > 7:
+            return []
+        k = min(cands)[1]
+        ex = self.p.extras[k]
+        out = []
+        for e in self.segments():
+            g = lambda f: num(ex.get((e, f)))
+            tot, sp, us = g("YTD Change (%)"), g("Spread Return YTD Change (%)"), g("UST Return YTD Change (%)")
+            if None in (tot, sp, us):
+                continue
+            out.append(dict(e=e, name=self.short(e), total=tot, spread=sp, ust=us,
+                            coupon=g("Coupon Return YTD Change (%)"),
+                            price=g("Price Return YTD Change (%)"),
+                            cross=tot - sp - us, asof=k))
+        return out
+
+    def scenario_values(self) -> List[Dict[str, Any]]:
+        """The Forecast tab's bear/base/bull defaults, evaluated in Python for the deck.
+        The workbook version is live; this one mirrors its defaults."""
+        out = []
+        for name, s in SCENARIOS:
+            drv = (self.spread + BETAS["ust10y_bp"] * s["ust"] + BETAS["dxy_pct"] * s["dxy"]
+                   + BETAS["vix_pts"] * s["vix"] + BETAS["rating_notches"] * s["rating"])
+            sp = s["spread"] if s["spread"] is not None else drv
+            tr = total_return(self.yld, self.IRD, self.D, s["ust"], self.spread, sp)
+            out.append(dict(name=name, ust=s["ust"], spread=sp, drivers=drv, tr=tr,
+                            excess=tr - CASH_RATE, prob=s["prob"]))
+        return out
+
+    # ---------- YTD attribution, JPM's legs, by segment ----------
+    def attribution_tab(self):
+        legs = self.jpm_legs()
+        if not legs:
+            return
+        ws = self.wb.create_sheet("YTD_Attribution")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = f"What explained the year — JPM's published decomposition, as of {legs[0]['asof']}"
+        F(ws["A1"], size=14, bold=True, color=C_HDR)
+        ws["A2"] = ("JPM splits each sub-index's YTD total return into the excess return over "
+                    "duration-matched Treasuries (spread move plus spread carry) and the Treasury "
+                    "return (rate move plus Treasury carry). They compound: total = (1 + excess) x "
+                    "(1 + Treasury) - 1, so the cross term is shown rather than hidden.")
+        F(ws["A2"], italic=True, color=C_NOTE)
+        ws.column_dimensions["A"].width = 22
+        for c in "BCDEFGH":
+            ws.column_dimensions[c].width = 15
+        r = 4
+        for i, h in enumerate(["Segment", "Weight %", "Total YTD %", "Excess over UST %",
+                               "Treasury %", "Cross term %", "Coupon %", "Price %"], start=1):
+            H(ws.cell(row=r, column=i), h)
+        r += 1
+        for L_ in legs:
+            is_idx = L_["e"] == INDEX
+            L(ws.cell(row=r, column=1), L_["name"], bold=is_idx, fill=C_BAND if is_idx else None)
+            V(ws.cell(row=r, column=2), self.p.get(self.d1, L_["e"], M_WGT), fmt="0.0")
+            V(ws.cell(row=r, column=3), L_["total"], fmt="+0.00;-0.00", bold=True,
+              fill=C_GOOD if L_["total"] >= 0 else C_BAD)
+            V(ws.cell(row=r, column=4), L_["spread"], fmt="+0.00;-0.00", color=C_HARD)
+            V(ws.cell(row=r, column=5), L_["ust"], fmt="+0.00;-0.00", color=C_HARD)
+            V(ws.cell(row=r, column=6), L_["cross"], fmt="+0.00;-0.00", color=C_NOTE)
+            V(ws.cell(row=r, column=7), L_["coupon"], fmt="+0.00;-0.00")
+            V(ws.cell(row=r, column=8), L_["price"], fmt="+0.00;-0.00")
+            r += 1
+        r += 1
+        for line in [
+            "Read across: a segment whose excess-over-Treasuries leg is large and positive while the "
+            "Treasury leg is negative earned its return from spreads and carry against a rates headwind.",
+            "This is JPM's arithmetic, not ours — the duration-based decomposition was removed because "
+            "it produced nonsense for distressed names. For Credit C and single names the cross term is "
+            "large because the legs are large; that is compounding, not an error.",
+        ]:
+            ws.cell(row=r, column=1, value=line)
+            F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+            r += 1
+
+    # ---------- cushion ----------
+    def cushion_tab(self):
+        rows = self.cushion_rows()
+        ws = self.wb.create_sheet("Cushion")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "Cushion — how much widening each segment can absorb before it loses to cash"
+        F(ws["A1"], size=14, bold=True, color=C_HDR)
+        ws["A2"] = (f"Cushion (bp) = (yield - cash {CASH_RATE:.2f}%) / spread duration x 100. It is the "
+                    f"spread widening over the next twelve months that would bring the total return "
+                    f"exactly to cash, rates unchanged. The second cushion assumes the 10y rises 50bp.")
+        F(ws["A2"], italic=True, color=C_NOTE)
+        ws.column_dimensions["A"].width = 22
+        for c in "BCDEFGHI":
+            ws.column_dimensions[c].width = 14
+        r = 4
+        for i, h in enumerate(["Segment", "Weight %", "Yield %", "Spread bp", "Spread dur",
+                               "Cushion bp", "Cushion if 10y +50bp", "Cushion / spread %",
+                               "12m return if nothing moves %"], start=1):
+            H(ws.cell(row=r, column=i), h)
+        r += 1
+        for c_ in rows:
+            is_idx = c_["e"] == INDEX
+            L(ws.cell(row=r, column=1), c_["name"], bold=is_idx, fill=C_BAND if is_idx else None)
+            V(ws.cell(row=r, column=2), c_["wgt"], fmt="0.0")
+            V(ws.cell(row=r, column=3), c_["yld"], fmt="0.00")
+            V(ws.cell(row=r, column=4), c_["spread"], fmt="0")
+            V(ws.cell(row=r, column=5), c_["D"], fmt="0.00")
+            for j, key in [(6, "cushion"), (7, "cushion_up50")]:
+                v = c_[key]
+                V(ws.cell(row=r, column=j), v, fmt="+0;-0", bold=(j == 6),
+                  fill=None if v is None else (C_GOOD if v >= 50 else (C_BAD if v < 0 else None)),
+                  color=C_NOTE if c_["distressed"] else C_TXT)
+            V(ws.cell(row=r, column=8), c_["cushion_pct"], fmt="0")
+            V(ws.cell(row=r, column=9), c_["yld"], fmt="0.00", color=C_NOTE if c_["distressed"] else C_TXT)
+            r += 1
+        r += 1
+        for line in [
+            "Blue: at least 50bp of room. Red: already below cash at today's yield. Grey text: yield above "
+            f"{DISTRESSED_YIELD:.0f}% is a recovery bet, not a carry you will collect.",
+            "The point for the committee: the argument for EM against cash is not the spread forecast, it is "
+            "how far spreads can go wrong before the carry is gone. That is the cushion column.",
+        ]:
+            ws.cell(row=r, column=1, value=line)
+            F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+            r += 1
+
+    # ---------- spread vs own history ----------
+    def spread_history_tab(self):
+        st = self.spread_stats()
+        if not st:
+            return
+        ws = self.wb.create_sheet("Spread_vs_History")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "Spreads against their own history — restated on today's basis"
+        F(ws["A1"], size=14, bold=True, color=C_HDR)
+        ws["A2"] = ("History is rebuilt from today's published level backwards using chain-linked daily "
+                    "moves, so the basis-break steps (including JPM's 04-Sep exclusion of defaulted names) "
+                    "are removed proportionally. Without this, today would read as a record tight for the wrong "
+                    "reason. It is an approximation; the last column says how much to trust each row.")
+        F(ws["A2"], italic=True, color=C_NOTE)
+        ws.column_dimensions["A"].width = 22
+        for c in "BCDEFGHIJKL":
+            ws.column_dimensions[c].width = 12
+        r = 4
+        for i, h in enumerate(["Segment", "Now bp", "1y low", "1y high", "Full low", "25th pct",
+                               "Median", "75th pct", "Full high", "Percentile now", "History from",
+                               "Break steps / level"], start=1):
+            H(ws.cell(row=r, column=i), h)
+        r += 1
+        for s_ in st:
+            is_idx = s_["e"] == INDEX
+            L(ws.cell(row=r, column=1), s_["name"], bold=is_idx, fill=C_BAND if is_idx else None)
+            V(ws.cell(row=r, column=2), s_["now"], fmt="0", bold=True, color=C_HARD)
+            for j, key in enumerate(["lo1y", "hi1y", "lo", "p25", "med", "p75", "hi"], start=3):
+                V(ws.cell(row=r, column=j), s_[key], fmt="0")
+            rk = s_["rank"]
+            V(ws.cell(row=r, column=10), rk, fmt="0", bold=True,
+              fill=None if rk is None else (C_BAD if rk <= 10 else (C_GOOD if rk >= 50 else None)))
+            V(ws.cell(row=r, column=11), s_["since"], fmt="@")
+            V(ws.cell(row=r, column=12), s_["share"], fmt="0%", color=C_NOTE if not s_["indicative"] else C_NOTOKTXT,
+              bold=s_["indicative"])
+            r += 1
+        r += 1
+        for line in [
+            "Percentile is the share of days in the restated history with a spread at or below today's. "
+            "Red: inside the tightest tenth of history — little room left from valuation alone. "
+            "Blue: at or above the median — spreads are not the constraint.",
+            "This is the slide that answers 'aren't spreads already too tight?' with a number instead of an adjective.",
+            "The last column is the size of the removed basis-break steps relative to today's level. Where it is "
+            "above 50% (red) the segment's composition changed too much — Lebanon in the Middle East, Russia and "
+            "Ukraine in Europe, the C bucket — and the restated history is indicative only.",
+        ]:
+            ws.cell(row=r, column=1, value=line)
+            F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+            r += 1
+
+    # ---------- what history says ----------
+    def return_history_tab(self):
+        rs = self.return_stats()
+        if not rs:
+            return
+        ws = self.wb.create_sheet("History_Says")
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = "What history says — every rolling 12-month total return in the sample"
+        F(ws["A1"], size=14, bold=True, color=C_HDR)
+        ws["A2"] = (f"{rs['n']} overlapping 12-month windows starting {rs['first']} to {rs['last']}, "
+                    f"from the index's own total return series. Overlapping windows are not independent "
+                    f"observations; read the percentiles as a description of the sample, not a probability.")
+        F(ws["A2"], italic=True, color=C_NOTE)
+        ws.column_dimensions["A"].width = 34
+        for c in "BCDEFGH":
+            ws.column_dimensions[c].width = 13
+        r = 4
+        r = band(ws, r, 3, "Distribution of 12-month total returns (%)")
+        for lbl, key, fmt in [("Worst window", "lo", "+0.00;-0.00"), ("10th percentile", "p10", "+0.00;-0.00"),
+                              ("25th percentile", "p25", "+0.00;-0.00"), ("Median", "med", "+0.00;-0.00"),
+                              ("75th percentile", "p75", "+0.00;-0.00"), ("90th percentile", "p90", "+0.00;-0.00"),
+                              ("Best window", "hi", "+0.00;-0.00"),
+                              ("Share of windows beating cash (%)", "beat_cash", "0"),
+                              ("Share of windows negative (%)", "negative", "0"),
+                              ("Latest 12 months", "latest", "+0.00;-0.00")]:
+            L(ws.cell(row=r, column=1), lbl, bold=key in ("med", "latest"))
+            V(ws.cell(row=r, column=2), rs[key], fmt=fmt, bold=key in ("med", "latest"), color=C_HARD)
+            if key == "lo":
+                ws.cell(row=r, column=3, value=f"window starting {rs['lo_start']}")
+            if key == "hi":
+                ws.cell(row=r, column=3, value=f"window starting {rs['hi_start']}")
+            F(ws.cell(row=r, column=3), italic=True, color=C_NOTE)
+            r += 1
+        r += 1
+        r = band(ws, r, 3, "Histogram — count of windows by 2pp bucket")
+        H(ws.cell(row=r, column=1), "Bucket"); H(ws.cell(row=r, column=2), "Windows")
+        r += 1
+        h0 = r
+        for lo, n in rs["buckets"]:
+            L(ws.cell(row=r, column=1), f"{lo:+.0f} to {lo + 2:+.0f}", bold=False)
+            V(ws.cell(row=r, column=2), n, fmt="0")
+            r += 1
+        h1 = r - 1
+        from openpyxl.chart import BarChart
+        ch = BarChart()
+        ch.type = "col"
+        ch.title = "Rolling 12m total returns, count by bucket"
+        ch.add_data(Reference(ws, min_col=2, min_row=h0 - 1, max_row=h1), titles_from_data=True)
+        ch.set_categories(Reference(ws, min_col=1, min_row=h0, max_row=h1))
+        ch.legend = None
+        ch.height, ch.width = 7.5, 16
+        ws.add_chart(ch, "E4")
+        r += 1
+        r = band(ws, r, 6, "Worst drawdowns in the total return index")
+        for i, h in enumerate(["Peak", "Trough", "Depth %", "Days to trough", "Recovered", "Days to recover"], start=1):
+            H(ws.cell(row=r, column=i), h)
+        r += 1
+        for dd in rs["drawdowns"]:
+            L(ws.cell(row=r, column=1), dd["peak"], bold=False)
+            V(ws.cell(row=r, column=2), dd["trough"], fmt="@")
+            V(ws.cell(row=r, column=3), dd["depth"], fmt="0.00", fill=C_BAD)
+            V(ws.cell(row=r, column=4), dd["days_down"], fmt="0")
+            V(ws.cell(row=r, column=5), dd["recovered"] or "not yet", fmt="@")
+            V(ws.cell(row=r, column=6), dd["days_back"], fmt="0")
+            r += 1
+        r += 1
+        scn = self.scenario_values()
+        r = band(ws, r, 6, "Where the scenarios sit (defaults from the Forecast tab)")
+        for i, h in enumerate(["Scenario", "10y change bp", "Spread bp", "12m return %", "vs cash pp", "Percentile of history"], start=1):
+            H(ws.cell(row=r, column=i), h)
+        r += 1
+        allv = [v for _d, v in rolling_12m_returns(self.p, INDEX)]
+        for s_ in scn:
+            L(ws.cell(row=r, column=1), s_["name"], bold=s_["name"] == "Base")
+            V(ws.cell(row=r, column=2), s_["ust"], fmt="+0;-0")
+            V(ws.cell(row=r, column=3), s_["spread"], fmt="0")
+            V(ws.cell(row=r, column=4), s_["tr"], fmt="0.00", bold=True,
+              fill=C_GOOD if s_["tr"] >= CASH_RATE else C_BAD)
+            V(ws.cell(row=r, column=5), s_["excess"], fmt="+0.00;-0.00")
+            V(ws.cell(row=r, column=6), pct_rank(allv, s_["tr"]), fmt="0")
+            r += 1
+        r += 1
+        ws.cell(row=r, column=1, value=(
+            "Use: a base case sitting near the historical median is easy to defend; one in the top decile "
+            "needs a reason. The drawdown table is the answer to 'what if we are wrong' — depth and time to "
+            "recover, from this index's own record."))
+        F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
+
     # ---------- basis breaks ----------
     def breaks_tab(self):
         ws = self.wb.create_sheet("Basis_Breaks")
@@ -1227,6 +1990,8 @@ class Dashboard:
             ws.cell(row=r, column=1, value=line)
             F(ws.cell(row=r, column=1), italic=True, color=C_NOTE)
             r += 1
+        r += 1
+        self._breaks_by_entity_block(ws, r)
 
     # ---------- methodology ----------
     def methodology(self):
@@ -1347,6 +2112,11 @@ class Dashboard:
         self.breaks_tab()
         self.forecast()
         self.sensitivity()
+        self.scenario_tab()
+        self.attribution_tab()
+        self.cushion_tab()
+        self.spread_history_tab()
+        self.return_history_tab()
         self.methodology()
         return self.wb
 
@@ -1367,6 +2137,8 @@ PPT_RED = (0xC8, 0x10, 0x2E)             # negatives, warnings
 PPT_GREY = (0x8C, 0x8C, 0x8C)            # secondary series
 PPT_MUTE = (0x59, 0x59, 0x59)            # captions
 PPT_PAPER, PPT_SOFT = (0xFF, 0xFF, 0xFF), (0xEF, 0xF2, 0xF6)
+PPT_OK, PPT_MARG, PPT_NOTOK = (0xC9, 0xD9, 0xEE), (0xE3, 0xE3, 0xE3), (0xF2, 0xC4, 0xC9)
+PPT_NOTOK_TXT = (0x9C, 0x0A, 0x1E)
 PPT_BLUE = PPT_BLUE                       # retained name, no gold in the palette
 PPT_DEEP = PPT_BLUE
 PPT_GOOD = PPT_BLUE
@@ -1462,6 +2234,9 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
 
     def rgb(t):
         return RGBColor(*t)
+
+    def bp(v) -> str:
+        return "n/a" if v is None else f"{v:+.0f}"
 
     def txt(sl, x, y, w, h, text, size=14, bold=False, color=PPT_INK,
             font="Arial", align=PP_ALIGN.LEFT, italic=False):
@@ -1652,8 +2427,8 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         for e, m, y, full in reg:
             rows.append([e, f"{panel.get(d1, full, M_WGT) or 0:.1f}",
                          f"{panel.get(d1, full, M_STW) or 0:.0f}",
-                         f"{m.get('spread_bp', 0):+.0f}", f"{m['total']:+.2f}",
-                         f"{y.get('spread_bp', 0):+.0f}", f"{y['total']:+.2f}"])
+                         bp(m.get('spread_bp')), f"{m['total']:+.2f}",
+                         bp(y.get('spread_bp')), f"{y['total']:+.2f}"])
         idxm = attribute(panel, INDEX, d0, d1) if d0 else None
         idxy = attribute(panel, INDEX, dash.d0, d1)
         if idxm and idxy:
@@ -1719,12 +2494,12 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
         rows = [["Leaders", "Wt %", "Spread bp", "Return %"]]
         for t, e, at in rk[:7]:
             rows.append([e[:20], f"{panel.get(d1, e, M_WGT) or 0:.1f}",
-                         f"{at.get('spread_bp', 0):+.0f}", f"{t:+.2f}"])
+                         bp(at.get('spread_bp')), f"{t:+.2f}"])
         table(s5, x, 2.3, 5.8, rows, [2.6, 0.9, 1.15, 1.15], size=11)
         rows = [["Laggards", "Wt %", "Spread bp", "Return %"]]
         for t, e, at in rk[-4:][::-1]:
             rows.append([e[:20], f"{panel.get(d1, e, M_WGT) or 0:.1f}",
-                         f"{at.get('spread_bp', 0):+.0f}", f"{t:+.2f}"])
+                         bp(at.get('spread_bp')), f"{t:+.2f}"])
         table(s5, x, 4.9, 5.8, rows, [2.6, 0.9, 1.15, 1.15], size=11)
     txt(s5, 0.7, 6.85, 11.9, 0.3,
         "Spread changes chain-linked; names below 0.25% of the index are excluded so the list "
@@ -1768,6 +2543,69 @@ def build_deck(panel: Panel, dash: "Dashboard", path: Path) -> bool:
     txt(s4, 0.7, 6.85, 11.9, 0.3,
         f"Curve beta {CURVE_BETA:.2f} (parallel shift). Betas are practitioner priors, not "
         f"fitted; the rates beta is unverified — see the workbook's Methodology tab.",
+        9, False, PPT_MUTE)
+
+    # ---------- 5. scenario grid ----------
+    s5 = prs.slides.add_slide(blank)
+    txt(s5, 0.7, 0.5, 12, 0.7, "Scenario grid — total return by US 10-year and spread level",
+        30, True, PPT_INK, "Arial")
+    txt(s5, 0.7, 1.15, 12, 0.45,
+        f"12-month total return, %. Rows are index spread levels, columns the US 10y. Spot: "
+        f"spread {sp:.0f}bp, 10y {dash.ust10y:.2f}%, yield {dash.yld:.2f}%, duration {dash.D:.2f}. "
+        f"Blue beats cash ({CASH_RATE:.2f}%) by {GRID_MARGIN_PP:.0f}pp or more, grey is within "
+        f"{GRID_MARGIN_PP:.0f}pp of cash, red is below cash by more than {GRID_MARGIN_PP:.0f}pp.",
+        12, False, PPT_MUTE)
+    levels, grows = scenario_grid(dash)
+    nr, nc = len(grows) + 1, len(levels) + 1
+    gw = 12.6
+    gt = s5.shapes.add_table(nr, nc, Inches(0.7), Inches(1.75), Inches(gw),
+                             Inches(0.36 * nr)).table
+    first_w = 1.35
+    gt.columns[0].width = Emu(int(Inches(first_w)))
+    for j in range(1, nc):
+        gt.columns[j].width = Emu(int(Inches((gw - first_w) / len(levels))))
+    spot_j = None
+    for j, lvl in enumerate(levels, start=1):
+        if abs(lvl - dash.ust10y) <= 0.005:
+            spot_j = j
+
+    def gcell(i, j, text, fill_c, txt_c, bold=False, align=PP_ALIGN.RIGHT):
+        c = gt.cell(i, j)
+        c.text = text
+        c.margin_left = c.margin_right = Emu(int(Inches(0.05)))
+        p = c.text_frame.paragraphs[0]
+        p.alignment = align
+        for r_ in p.runs:
+            r_.font.size = Pt(10); r_.font.name = "Arial"
+            r_.font.bold = bold; r_.font.color.rgb = rgb(txt_c)
+        c.fill.solid(); c.fill.fore_color.rgb = rgb(fill_c)
+
+    gcell(0, 0, "Spread \\ US 10y", PPT_BLUE, PPT_PAPER, True, PP_ALIGN.LEFT)
+    for j, lvl in enumerate(levels, start=1):
+        gcell(0, j, f"{lvl:.2f}%" + (" spot" if j == spot_j else ""), PPT_BLUE, PPT_PAPER, True)
+    for i, (lab, s_, vals) in enumerate(grows, start=1):
+        spot_row = lab.startswith("Spot")
+        gcell(i, 0, lab, PPT_SOFT if spot_row else PPT_PAPER, PPT_INK, spot_row, PP_ALIGN.LEFT)
+        for j, tr in enumerate(vals, start=1):
+            v = grid_verdict(tr)
+            fill_c = {"ok": PPT_OK, "marginal": PPT_MARG, "bad": PPT_NOTOK}[v]
+            txt_c = {"ok": PPT_BLUE, "marginal": PPT_INK, "bad": PPT_NOTOK_TXT}[v]
+            gcell(i, j, f"{tr:.1f}", fill_c, txt_c, bold=(j == spot_j or spot_row))
+    # break-even line and where the competing forecasts land
+    be_now = sp + (dash.yld - CASH_RATE) * 100.0 / dash.D
+    be_up = sp + (dash.yld - dash.IRD * 0.5 - CASH_RATE) * 100.0 / dash.D
+    be_dn = sp + (dash.yld + dash.IRD * 0.5 - CASH_RATE) * 100.0 / dash.D
+    y_note = 1.75 + 0.36 * nr + 0.2
+    txt(s5, 0.7, y_note, 11.9, 0.9,
+        f"Break-even spread: {be_now:.0f}bp with the 10y unchanged at {dash.ust10y:.2f}%; "
+        f"{be_up:.0f}bp if the 10y rises 50bp to {dash.ust10y + 0.5:.2f}%; {be_dn:.0f}bp if it "
+        f"falls 50bp to {dash.ust10y - 0.5:.2f}%. Every basis point of spread is worth "
+        f"{dash.D / 100:.3f}% of return; every basis point on the 10y is worth "
+        f"{dash.IRD / 100:.3f}%.",
+        12, False, PPT_INK, italic=True)
+    txt(s5, 0.7, y_note + 0.95, 11.9, 0.3,
+        "Spread and rates set independently — the bottom-right overstates the pain of a risk-off, "
+        "where the Treasury rally offsets part of the widening. Convexity ignored.",
         9, False, PPT_MUTE)
 
     prs.save(str(path))
@@ -1821,11 +2659,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if archive.exists():
         files += sorted(archive.glob("*.csv"))
     added = 0
+    rejected = 0
     for p in files:
         if p.name in (EXTENDED_CSV, EXTRAS_CSV) or not Panel.is_snapshot(p):
             continue
         res = panel.ingest_snapshot(p, known)
         if not res:
+            rejected += 1
             continue
         d, nv, new = res
         print(f"Snapshot : {d}  {p.name}  ({nv} values, {new} new series)")
@@ -1835,6 +2675,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if p.resolve() != dest.resolve() and not dest.exists():
             dest.write_bytes(p.read_bytes())
 
+    if rejected:
+        print(f"\n{rejected} file(s) REJECTED as not EMBI Global Diversified — see above. If any "
+              f"of them sit in {ARCHIVE_DIR}/, delete them there too, and delete "
+              f"{EXTENDED_CSV} and {EXTRAS_CSV} so a clean copy is rebuilt from the history "
+              f"workbook on this run.", file=sys.stderr)
     if not panel.data:
         print("ERROR: no data at all.", file=sys.stderr)
         return 1
