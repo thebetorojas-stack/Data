@@ -27,7 +27,7 @@ The four "flavours" you asked for, all driven by GRADE / MIN_SPREAD_BP / PICK:
 Inputs:  data/current/*.txt (the 7 weekly feed files). Prev-week, PRIIPS and
          legal-exclusion files are picked up automatically if present, like
          run_weekly.py does, but are optional here.
-Output:  outputs/Bond_Ladder_<GRADE>_<PICK>[_<spread>bp].xlsx
+Output:  outputs/Bond_Ladder_<GRADE>_<PICK>[_<spread>bp].xlsx  +  .pdf (one page, for FAs)
            • Ladder      — the picked bond per rung + summary
            • Candidates  — every eligible bond per rung, ranked (see who lost)
            • Settings    — the CONFIG + the EM curve used, for the audit trail
@@ -45,7 +45,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from gem_report_builder_v3 import (GEMData, is_subordinated_bond,   # noqa: E402
-                                   parse_rating, rating_tier)      # business logic lives there
+                                   parse_rating, rating_tier,      # business logic lives there
+                                   register_fonts, DEFAULT_LOGO_PATH, INDICATIVE_MARK,
+                                   UBS_DARK, UBS_MID, UBS_HEADER_BG, UBS_RULE, UBS_LIGHT)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — the only block you normally touch
@@ -99,6 +101,9 @@ CURVE_MIN_BONDS  = 5                  # a rung with fewer bonds is interpolated 
 DATA_DIR   = 'data'
 OUTPUT_DIR = 'outputs'
 OUTPUT_FILE = None                    # None = auto name, or e.g. 'outputs/my_ladder.xlsx'
+MAKE_PDF    = True                    # also write a one-page PDF (same name, .pdf) to email to FAs
+PDF_TITLE   = None                    # None = auto, e.g. 'USD Investment Grade EM Bond Ladder, 1-10y'
+PDF_LOGO    = DEFAULT_LOGO_PATH       # 'assets/UBS_Logo.png' — skipped silently if absent
 
 # ══════════════════════════════════════════════════════════════════════════════
 # End of CONFIG. Everything below just does what the block above says.
@@ -459,6 +464,163 @@ def write_excel(ladder, ranked, curve, path):
     print(f'\n[ladder] written -> {path}')
 
 
+def _ladder_label():
+    grade = {'IG': 'Investment Grade', 'HY': 'High Yield', 'ANY': ''}[GRADE]
+    uni = {'sovereign': 'Sovereign', 'corporate': 'Corporate', 'all': ''}[UNIVERSE]
+    ccy = '' if CURRENCY == 'ANY' else CURRENCY
+    bits = [x for x in (ccy, REGION or '', grade, uni) if x]
+    return ' '.join(bits) + f' EM Bond Ladder, {LADDER_YEARS[0]}-{LADDER_YEARS[-1]}y'
+
+
+def _ladder_rule_text():
+    pick = {'yield': 'highest offer yield', 'price': 'lowest offer price',
+            'both': 'best combination of yield and price'}[PICK]
+    per = 'One bond' if BONDS_PER_RUNG == 1 else f'Up to {BONDS_PER_RUNG} bonds'
+    txt = (f'{per} per maturity year from {LADDER_YEARS[0]} to {LADDER_YEARS[-1]} years, '
+           f'selected from the CIO Emerging Markets Bond List: {pick} per rung')
+    if MIN_SPREAD_BP is not None:
+        txt += f', yielding at least {MIN_SPREAD_BP:g}bp over US Treasuries'
+    if ONE_BOND_PER_ISSUER:
+        txt += ', no issuer repeated'
+    if EXCLUDE_SUBORDINATED:
+        txt += ', senior bonds only'
+    if EXCLUDE_SELL:
+        txt += ', no Sell-rated bonds'
+    return txt + '.'
+
+
+def write_pdf(ladder, data, path):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, KeepTogether)
+
+    fonts = register_fonts()
+    F, FB, FI = fonts['light'], fonts['bold'], fonts['italic']
+    W, H = landscape(A4)
+    ML = MR = 1.5 * cm
+    title = PDF_TITLE or _ladder_label()
+    as_of = data.data_timestamp()
+
+    st_title = ParagraphStyle('t', fontName=FB, fontSize=16, leading=20, textColor=UBS_DARK)
+    st_sub   = ParagraphStyle('s', fontName=F,  fontSize=9.5, leading=12, textColor=UBS_MID)
+    st_body  = ParagraphStyle('b', fontName=F,  fontSize=8.5, leading=11, textColor=UBS_DARK)
+    st_cell  = ParagraphStyle('c', fontName=F,  fontSize=8,   leading=10, textColor=UBS_DARK)
+    st_cellr = ParagraphStyle('cr', parent=st_cell, alignment=TA_RIGHT)
+    st_hdr   = ParagraphStyle('h', fontName=FB, fontSize=8,   leading=10, textColor=colors.white)
+    st_hdrr  = ParagraphStyle('hr', parent=st_hdr, alignment=TA_RIGHT)
+    st_note  = ParagraphStyle('n', fontName=F,  fontSize=7,   leading=9, textColor=UBS_MID)
+    st_empty = ParagraphStyle('e', fontName=FI, fontSize=8,   leading=10, textColor=UBS_MID)
+
+    def on_page(canv, doc):
+        canv.saveState()
+        if PDF_LOGO and os.path.exists(PDF_LOGO):
+            try:
+                canv.drawImage(PDF_LOGO, ML, H - 1.9 * cm, width=2.2 * cm, height=1.1 * cm,
+                               preserveAspectRatio=True, mask='auto')
+            except Exception:
+                pass
+        canv.setFont(F, 8); canv.setFillColor(UBS_MID)
+        y = H - 1.0 * cm
+        for line in (f'Publication date: {date.today().strftime("%d %B %Y")}',
+                     'Chief Investment Office GWM', 'Investment Research'):
+            canv.drawRightString(W - MR, y, line); y -= 0.35 * cm
+        canv.setStrokeColor(UBS_RULE); canv.setLineWidth(0.5)
+        canv.line(ML, 1.35 * cm, W - MR, 1.35 * cm)
+        canv.setFont(F, 7)
+        canv.drawString(ML, 0.9 * cm, 'Source: UBS, rating agencies')
+        canv.drawRightString(W - MR, 0.9 * cm, f'Page {doc.page}')
+        canv.restoreState()
+
+    # ---- table ---------------------------------------------------------------
+    cols = [  # header, key, width(cm), align-right?
+        ('Rung',            'rung',          1.2, True),
+        ('Issuer',          'issuer',        6.6, False),
+        ('ISIN / Valor',    'isin_valor',    3.9, False),
+        ('Coupon',          'coupon',        1.6, True),
+        ('Maturity',        'maturity',      2.0, True),
+        (f'Offer price{INDICATIVE_MARK}', 'px',  1.8, True),
+        (f'Offer yield{INDICATIVE_MARK}', 'yld', 1.8, True),
+        ("S&amp;P / Moody's", 'ratings',     2.5, False),
+        ('CIO view',        'view',          1.5, False),
+        ('Min. denom.',     'min_denom',     2.6, True),
+        ('Restr.',          'restrictions',  1.2, False),
+    ]
+    head = [Paragraph(h, st_hdrr if r else st_hdr) for h, _, _, r in cols]
+    rows, cmds = [head], []
+    for i, r in enumerate(ladder, 1):
+        if r.get('empty'):
+            cells = [Paragraph(f'{r["rung"]}y', st_cellr),
+                     Paragraph('No eligible bond' + (' — all candidates already used'
+                               if 'blocked' in r['note'] else ' in this maturity window'), st_empty)
+                     ] + [''] * (len(cols) - 2)
+            cmds.append(('SPAN', (1, i), (-1, i)))
+        else:
+            vals = {'rung': f'{r["rung"]}y', 'px': f'{r["px"]:.1f}', 'yld': f'{r["yld"]:.2f}%',
+                    'restrictions': r.get('restrictions') or ''}
+            cells = [Paragraph(str(vals.get(k, r.get(k, ''))), st_cellr if right else st_cell)
+                     for _, k, _, right in cols]
+        rows.append(cells)
+        if i % 2 == 0:
+            cmds.append(('BACKGROUND', (0, i), (-1, i), UBS_LIGHT))
+
+    filled = [r for r in ladder if not r.get('empty')]
+    if filled:
+        n = len(filled)
+        avg = [Paragraph('', st_cell), Paragraph(f'Equal-weighted average ({n} bonds)', ParagraphStyle('a', parent=st_cell, fontName=FB)),
+               '', '', '',
+               Paragraph(f'{sum(r["px"] for r in filled)/n:.1f}', ParagraphStyle('ar', parent=st_cellr, fontName=FB)),
+               Paragraph(f'{sum(r["yld"] for r in filled)/n:.2f}%', ParagraphStyle('ar2', parent=st_cellr, fontName=FB)),
+               '', '', '', '']
+        rows.append(avg)
+        cmds += [('LINEABOVE', (0, len(rows) - 1), (-1, len(rows) - 1), 0.75, UBS_DARK),
+                 ('BACKGROUND', (0, len(rows) - 1), (-1, len(rows) - 1), colors.white)]
+
+    tbl = Table(rows, colWidths=[w * cm for _, _, w, _ in cols], repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ('BACKGROUND',    (0, 0), (-1, 0), UBS_HEADER_BG),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING',    (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
+        ('LINEBELOW',     (0, 0), (-1, 0), 0.75, UBS_DARK),
+        ('LINEBELOW',     (0, 1), (-1, -1), 0.25, UBS_RULE),
+    ] + cmds))
+
+    story = [
+        Spacer(1, 0.6 * cm),
+        Paragraph(title, st_title),
+        Paragraph('Chief Investment Office GWM  |  Emerging Markets Bond List', st_sub),
+        Spacer(1, 0.25 * cm),
+        Paragraph(_ladder_rule_text(), st_body),
+        Spacer(1, 0.35 * cm),
+        tbl,
+        Spacer(1, 0.3 * cm),
+        Paragraph(f'{INDICATIVE_MARK} Indicative values. Market data as of {as_of}; prices and '
+                  f'yields are indicative only and may not be available in every jurisdiction. '
+                  f'Ratings shown as S&amp;P / Moody\'s. CIO view: attr. = attractive, fair = fair value, '
+                  f'exp. = expensive. Restr.: 1 = MiFID complex product, 2 = PRIIPs-relevant, no KID. '
+                  f'Minimum denomination shown as minimum amount / increment.', st_note),
+    ]
+    if MIN_SPREAD_BP is not None:
+        story.append(Paragraph(
+            f'Spread screen: yield compared with the median yield of the EM Bond List at the same '
+            f'maturity, assuming the EMBI Global trades at least {EMBI_OVER_UST_BP}bp over US '
+            f'Treasuries; bonds shown are therefore at least {MIN_SPREAD_BP:g}bp over Treasuries.',
+            st_note))
+
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    doc = SimpleDocTemplate(path, pagesize=(W, H), leftMargin=ML, rightMargin=MR,
+                            topMargin=1.6 * cm, bottomMargin=1.7 * cm,
+                            title=title, author='UBS CIO GWM')
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    print(f'[ladder] written -> {path}')
+
+
 # ---- 5. CLI overrides (optional; CONFIG is the default) ----------------------
 
 def apply_cli():
@@ -506,6 +668,8 @@ def main():
         + (f'_{MIN_SPREAD_BP:g}bp' if MIN_SPREAD_BP is not None else '')
         + (f'_{REGION.replace(" ", "")}' if REGION else '') + '.xlsx')
     write_excel(ladder, ranked, curve, out)
+    if MAKE_PDF:
+        write_pdf(ladder, data, os.path.splitext(out)[0] + '.pdf')
     return ladder
 
 
