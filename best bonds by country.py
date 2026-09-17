@@ -832,7 +832,7 @@ def write_excel(path, cfg, results, picks, peer_tables, curve_info, dropped, as_
                  ("Rating", "rating", None), ("Yield %", "yield_pct", P2), ("12m TR base", "tr_base", P),
                  ("TR rally", "tr_rally", P), ("TR sell-off", "tr_selloff", P)]
     for _, p in top1.iterrows():
-        ws.cell(row=r0, column=1, value=f"{p.issuer} {p.coupon:g}% {p.maturity} ({p["isin"]}) — {p.rating}, "
+        ws.cell(row=r0, column=1, value=f"{p.issuer} {p.coupon:g}% {p.maturity} ({p['isin']}) — {p.rating}, "
                                         f"TR {p.tr_base * 100:.2f}% vs peer median {p.peer_tr_base * 100:.2f}%").font = bold
         rows = peer_tables[p["isin"]].head(15).to_dict("records")
         for j, (h, _, _) in enumerate(peer_cols, 1):
@@ -921,7 +921,7 @@ def run(cfg, select, label, verbose=True):
         print(f"\nUniverse scored: {len(scored)} bonds | chosen from: {len(tgt_isins)} | peers from whole universe")
         top1 = picks[picks.pick_type.str.startswith("Top 1 on curve")] if len(picks) else picks
         for _, p in top1.iterrows():
-            print(f"  {p.curve_key:<38} {p["isin"]}  {p.coupon:g}% {p.maturity}  TR {p.tr_base * 100:5.2f}% "
+            print(f"  {p.curve_key:<38} {p['isin']}  {p.coupon:g}% {p.maturity}  TR {p.tr_base * 100:5.2f}% "
                   f"vs peers {p.peer_tr_base * 100:5.2f}%  ({p.xs_base_bp:+.0f}bp)")
         print(f"\nSaved: {out}")
     return out, results, picks
