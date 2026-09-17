@@ -208,22 +208,8 @@ def build_gemdata(cfg, verbose=True):
     if missing and verbose:
         print("  ! feed files not found in data/current: " + ", ".join(missing))
 
-    # 1) if run_weekly.py has a helper that builds the paths / data, use it
-    try:
-        import run_weekly as rw
-        for name in ("build_paths", "find_paths", "discover_paths", "data_paths", "build_data", "load_data"):
-            fn = getattr(rw, name, None)
-            if callable(fn):
-                try:
-                    obj = fn()
-                except TypeError:
-                    obj = fn(data_dir)
-                if isinstance(obj, g.GEMData):
-                    return obj, g, f"run_weekly.{name}()"
-                if isinstance(obj, dict):
-                    return g.GEMData(obj), g, f"GEMData(run_weekly.{name}())"
-    except ImportError:
-        pass
+    # NOTE: run_weekly.py is deliberately NOT imported — importing it would execute the
+    # whole weekly build (PDF, both Excels, ladder, restrictions workbook).
 
     # 2) otherwise read GEMData.__init__ and feed it what it asks for
     sig = inspect.signature(g.GEMData.__init__)
