@@ -5,11 +5,15 @@ best_bonds_by_country.py
 Finds the best bonds on each country curve, judged on the KPI that matters:
 EXPECTED 12-MONTH TOTAL RETURN vs. THE MEDIAN OF SIMILARLY RATED PEERS.
 
+Reads the weekly feed (the seven text files in data/current) THROUGH GEMData from
+gem_report_builder_v3.py, so eligibility, issuer names, ratings and CIO views are
+exactly those of the published Offshore list. Keep it in the gem_pipeline folder.
+
 Run:   F5 in Spyder (edit CONFIG), or
        python best_bonds_by_country.py
        python best_bonds_by_country.py --country Peru --country Colombia
-       python best_bonds_by_country.py --data "data/current/Offshore_EMBL.xlsx"
-       python best_bonds_by_country.py --show-columns      (check column detection)
+       python best_bonds_by_country.py --data "W:/.../gem_pipeline/data/current"
+       python best_bonds_by_country.py --show-universe     (list countries/issuers found)
 
 This file also holds the ENGINE. best_bonds_by_issuer.py imports it, so both
 scripts always score bonds the same way.
@@ -18,8 +22,8 @@ scripts always score bonds the same way.
 MAINTAINER'S GUIDE (where to change things)
 -----------------------------------------------------------------------------
   Countries to run ............ CONFIG["COUNTRIES"]
-  Input file / folder ......... CONFIG["DATA_PATH"]
-  A column is not detected .... CONFIG["COLUMN_MAP"]  (your header -> field)
+  Feed folder ................. CONFIG["DATA_DIR"]  (the 7 text files, via GEMData)
+  GEMData wants another file .. CONFIG["GEMDATA_PATHS"]
   Peer definition ............. PEER_NOTCH_BAND / PEER_MATURITY_BAND / PEER_MIN_COUNT
   Scenario size / betas ....... SCENARIO_SHIFT_BP / SCENARIO_BETA
   How much cheapness closes ... REVERSION_SHARE   (0 = ignore curve cheapness)
@@ -49,15 +53,14 @@ CONFIG = {
     "CURRENCY": "USD",                # "all" to keep every currency (peers always matched on currency)
 
     # --- input -------------------------------------------------------------
-    # A file (.xlsx/.xls/.csv/.txt) or a folder (newest matching file is used).
-    "DATA_PATH": "data/current",
-    "FILE_PATTERN": r"(?i)offshore.*\.(xlsx|xls)$|\.(csv|txt)$",
-    "SHEET": None,                    # None = auto-pick the sheet that looks like a bond list
+    # The seven weekly feed text files, read through GEMData exactly as the
+    # published list is. Relative paths are taken from this script's folder.
+    "DATA_DIR": "data/current",
+    "PREV_DIR": None,                 # not needed (no week-on-week diff here)
+    "GEMDATA_PATHS": {},              # only if GEMData asks for an input the script can't find:
+                                      #   {"<constructor key>": "<path>"}
     "AS_OF": None,                    # "2026-09-17" or None = today
-    # Force a column mapping if auto-detection misses one: {"Your Header": "field"}
-    # fields: isin issuer country currency coupon maturity price yield sp moody fitch
-    #         duration view amount issuer_type seniority call_date
-    "COLUMN_MAP": {},
+    "INCLUDE_FIXED_TO_FLOAT": False,  # AT1/T2/hybrids: feed yield is to call, model prices to maturity -> off
 
     # --- output ------------------------------------------------------------
     "OUTPUT_DIR": "outputs",
@@ -123,121 +126,211 @@ SOVEREIGN_NAME_HINTS = [
 ]
 
 # =============================================================================
-# Column detection
+# Data: read the weekly feed through GEMData (gem_report_builder_v3.py)
 # =============================================================================
-FIELD_ALIASES = {
-    "isin":        ["isin", "isin code", "isin/valor", "security id"],
-    "issuer":      ["issuer", "issuer name", "name", "borrower", "company"],
-    "country":     ["country", "country of risk", "cntry", "country name", "risk country"],
-    "currency":    ["currency", "ccy", "crncy", "cur"],
-    "coupon":      ["coupon", "cpn", "coupon (%)", "coupon rate"],
-    "maturity":    ["maturity", "maturity date", "mat date", "maturity/call", "final maturity"],
-    "price":       ["offer price", "ask price", "price", "px ask", "mid price", "offer px", "price (offer)"],
-    "yield":       ["offer yield", "ask yield", "yield", "ytw", "ytm", "yield to worst",
-                    "yield to maturity", "yld", "yield (offer)"],
-    "sp":          ["s&p", "s&p rating", "sp rating", "rtg_sp", "s&p issue rating"],
-    "moody":       ["moody's", "moodys", "moody's rating", "rtg_moody", "moody"],
-    "fitch":       ["fitch", "fitch rating", "rtg_fitch"],
-    "duration":    ["modified duration", "mod duration", "mod dur", "duration", "dur"],
-    "view":        ["cio view", "view", "recommendation", "house view", "cio rating"],
-    "amount":      ["amount outstanding", "amt outstanding", "outstanding", "issue size",
-                    "amount issued", "size"],
-    "issuer_type": ["issuer type", "sector", "type", "asset class", "bond type", "segment"],
-    "seniority":   ["seniority", "rank", "payment rank", "subordination", "ranking"],
-    "call_date":   ["next call date", "call date", "next call"],
-}
-
+FEED_FILES = ["CurrentPublishableBondData", "CurrentPublishableIssuerData", "IssuerRatings",
+              "IssuerTexts", "PublishableBondDataUpdate", "PublishableColorFlags",
+              "PublishableIssuerDataUpdate"]
 
 def _norm(s):
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
-def _match_headers(headers, column_map):
-    """Return {field: original_header}. COLUMN_MAP wins, then exact alias, then contains."""
-    out = {}
-    normed = {h: _norm(h) for h in headers if h is not None and str(h).strip()}
-    for header, field in (column_map or {}).items():
-        for h in normed:
-            if _norm(h) == _norm(header):
-                out[field] = h
-    used = set(out.values())
-    for field, aliases in FIELD_ALIASES.items():
-        if field in out:
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+
+def _abs(path):
+    return path if os.path.isabs(path) else os.path.join(_HERE, path)
+
+
+def _feed_paths(data_dir):
+    """{stem: full path} for the feed files found in data_dir (any extension)."""
+    found = {}
+    for f in os.listdir(data_dir):
+        stem = os.path.splitext(f)[0]
+        if f.startswith("~$"):
             continue
-        for alias in aliases:                                   # exact
-            hit = next((h for h, n in normed.items() if n == alias and h not in used), None)
-            if hit:
-                out[field] = hit; used.add(hit); break
-    for field, aliases in FIELD_ALIASES.items():
-        if field in out or field in ("name",):
+        for want in FEED_FILES:
+            if stem.lower() == want.lower():
+                found[want] = os.path.join(data_dir, f)
+    return found
+
+
+def _match_key(key, feed):
+    """Map a GEMData path key / parameter name to a feed file by its wording."""
+    k = key.lower()
+    if any(t in k for t in ("prev", "previous", "last", "priips", "legal", "exclusion",
+                            "template", "logo", "output", "out_")):
+        return None
+    is_upd = any(t in k for t in ("upd", "update"))
+    if any(t in k for t in ("color", "colour", "flag")):
+        stem = "PublishableColorFlags"
+    elif "rating" in k:
+        stem = "IssuerRatings"
+    elif any(t in k for t in ("text", "comment", "desc")):
+        stem = "IssuerTexts"
+    elif "issuer" in k:
+        stem = "PublishableIssuerDataUpdate" if is_upd else "CurrentPublishableIssuerData"
+    elif "bond" in k:
+        stem = "PublishableBondDataUpdate" if is_upd else "CurrentPublishableBondData"
+    else:
+        return None
+    return feed.get(stem)
+
+
+def _optional_files(root_dirs, token):
+    hits = []
+    for d in root_dirs:
+        if not os.path.isdir(d):
             continue
-        for alias in aliases:                                   # contains (longer aliases only)
-            if len(alias) < 5:
-                continue
-            hit = next((h for h, n in normed.items() if alias in n and h not in used), None)
-            if hit:
-                out[field] = hit; used.add(hit); break
-    return out
+        for f in os.listdir(d):
+            if token in f.lower() and not f.startswith("~$") and "template" not in f.lower():
+                hits.append(os.path.join(d, f))
+    return max(hits, key=os.path.getmtime) if hits else None
 
 
-def _find_table(raw, column_map):
-    """raw = header-less DataFrame. Find the header row with the most field hits."""
-    best = (0, None, {})
-    for r in range(min(40, len(raw))):
-        headers = [str(x) if pd.notna(x) else None for x in raw.iloc[r].tolist()]
-        m = _match_headers(headers, column_map)
-        score = len(m) + (3 if "isin" in m else 0) + (2 if "yield" in m or "price" in m else 0)
-        if score > best[0]:
-            best = (score, r, m)
-    return best
+def build_gemdata(cfg, verbose=True):
+    """Construct GEMData exactly as the weekly run does, discovering the constructor's
+    expected inputs at run time so this script never hard-codes their names."""
+    import inspect
+    try:
+        import gem_report_builder_v3 as g
+    except ImportError as exc:
+        raise SystemExit(f"Cannot import gem_report_builder_v3.py ({exc}). "
+                         "Keep this script in the gem_pipeline folder next to it.")
+    data_dir = _abs(cfg["DATA_DIR"])
+    if not os.path.isdir(data_dir):
+        raise SystemExit(f"DATA_DIR not found: {data_dir}")
+    feed = _feed_paths(data_dir)
+    missing = [f for f in FEED_FILES if f not in feed]
+    if missing and verbose:
+        print("  ! feed files not found in data/current: " + ", ".join(missing))
 
+    # 1) if run_weekly.py has a helper that builds the paths / data, use it
+    try:
+        import run_weekly as rw
+        for name in ("build_paths", "find_paths", "discover_paths", "data_paths", "build_data", "load_data"):
+            fn = getattr(rw, name, None)
+            if callable(fn):
+                try:
+                    obj = fn()
+                except TypeError:
+                    obj = fn(data_dir)
+                if isinstance(obj, g.GEMData):
+                    return obj, g, f"run_weekly.{name}()"
+                if isinstance(obj, dict):
+                    return g.GEMData(obj), g, f"GEMData(run_weekly.{name}())"
+    except ImportError:
+        pass
 
-def _resolve_path(path, pattern):
-    if os.path.isfile(path):
-        return path
-    if os.path.isdir(path):
-        files = [os.path.join(path, f) for f in os.listdir(path)
-                 if re.search(pattern, f) and not f.startswith("~$")]
-        if not files:
-            raise FileNotFoundError(f"No file matching {pattern!r} in {path}")
-        return max(files, key=os.path.getmtime)
-    raise FileNotFoundError(f"DATA_PATH not found: {path}")
+    # 2) otherwise read GEMData.__init__ and feed it what it asks for
+    sig = inspect.signature(g.GEMData.__init__)
+    params = [p for p in sig.parameters.values() if p.name != "self"]
+    src = ""
+    try:
+        src = inspect.getsource(g.GEMData.__init__)
+    except OSError:
+        pass
+    prev_dir = _abs(cfg["PREV_DIR"]) if cfg.get("PREV_DIR") else None
+    roots = [data_dir, os.path.dirname(data_dir), _HERE]
+
+    def value_for(name):
+        v = _match_key(name, feed)
+        if v:
+            return v
+        n = name.lower()
+        if "priips" in n:
+            return _optional_files(roots, "priips")
+        if "legal" in n or "exclusion" in n:
+            return _optional_files(roots, "legal") or _optional_files(roots, "exclusion")
+        if "prev" in n or "previous" in n or "last" in n:
+            return None            # week-on-week diff not needed here
+        return None
+
+    # single positional dict-style constructor: GEMData(paths)
+    if len(params) >= 1 and params[0].default is inspect._empty and (
+            "path" in params[0].name.lower() or "file" in params[0].name.lower() or len(params) == 1):
+        keys = sorted(set(re.findall(r"""%s(?:\[|\.get\()\s*['"]([^'"]+)['"]""" % re.escape(params[0].name), src)))
+        if keys:
+            paths = {k: value_for(k) for k in keys}
+            unmatched = [k for k, v in paths.items() if v is None and not any(t in k.lower() for t in ("prev", "priips", "legal", "exclusion", "last"))]
+            if unmatched:
+                raise SystemExit("GEMData expects inputs I could not match to a feed file: "
+                                 f"{unmatched}. Add them to CONFIG['GEMDATA_PATHS'].")
+            paths.update({k: _abs(v) for k, v in cfg.get("GEMDATA_PATHS", {}).items()})
+            return g.GEMData(paths), g, "GEMData(paths dict)"
+    # keyword-style constructor: GEMData(bond_file=..., issuer_file=..., ...)
+    kwargs = {}
+    for p in params:
+        v = value_for(p.name)
+        if v is not None:
+            kwargs[p.name] = v
+        elif p.default is inspect._empty:
+            raise SystemExit(f"GEMData needs '{p.name}' and I could not match it to a feed file. "
+                             f"Signature: GEMData{sig}. Add it to CONFIG['GEMDATA_PATHS'].")
+    kwargs.update({k: _abs(v) for k, v in cfg.get("GEMDATA_PATHS", {}).items()})
+    return g.GEMData(**kwargs), g, "GEMData(**kwargs)"
 
 
 def load_universe(cfg, verbose=True):
-    path = _resolve_path(cfg["DATA_PATH"], cfg["FILE_PATTERN"])
-    ext = os.path.splitext(path)[1].lower()
-    candidates = []
-    if ext in (".xlsx", ".xls", ".xlsm"):
-        sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
-        if cfg.get("SHEET"):
-            sheets = {cfg["SHEET"]: sheets[cfg["SHEET"]]}
-        for name, raw in sheets.items():
-            score, r, m = _find_table(raw, cfg["COLUMN_MAP"])
-            if r is not None:
-                bonus = 2 if re.search(r"(?i)bond ?list", name) else 0
-                candidates.append((score + bonus, name, r, m, raw))
-    else:
-        sep = "\t" if ext == ".txt" else ","
-        raw = pd.read_csv(path, header=None, dtype=object, sep=sep, engine="python")
-        score, r, m = _find_table(raw, cfg["COLUMN_MAP"])
-        candidates.append((score, os.path.basename(path), r, m, raw))
-    if not candidates:
-        raise ValueError(f"Could not find a bond table in {path}")
-    _, sheet, hdr_row, mapping, raw = max(candidates, key=lambda c: c[0])
-    df = raw.iloc[hdr_row + 1:].copy()
-    df.columns = [str(x) if pd.notna(x) else f"_col{i}" for i, x in enumerate(raw.iloc[hdr_row])]
-    df = df.rename(columns={v: k for k, v in mapping.items()})
-    keep = [f for f in FIELD_ALIASES if f in df.columns]
-    df = df[keep].copy()
+    """The published Offshore universe (same eligibility as the Excel/PDF), one row per bond,
+    with the fields the engine needs. Returns (DataFrame, description, {field: source})."""
+    data, g, how = build_gemdata(cfg, verbose)
+    try:
+        from gem_excel_builder import is_offshore_eligible, _has_issuer_name
+    except Exception:                                   # builder absent -> em_bonds as-is
+        is_offshore_eligible = lambda b, d: True
+        _has_issuer_name = lambda b, d: True
+    bonds = getattr(data, "em_bonds", None) or getattr(data, "bonds", [])
+    rows = []
+    for bond in bonds:
+        if not (is_offshore_eligible(bond, data) and _has_issuer_name(bond, data)):
+            continue
+        isin = (bond.get("Isin") or "").strip()
+        gk = (bond.get("GK_Nummer") or "").strip()
+        upd = data.bond_updates.get(isin, {}) if hasattr(data, "bond_updates") else {}
+        rec = (upd.get("WMR_Bond_Recommendation") or bond.get("WMR_Bond_Recommendation") or "").strip().upper()
+        view = {"OP": "attr.", "UP": "exp.", "SELL": "sell"}.get(rec, "fair")
+        cc = data.issuer_country_code(gk) or ""
+        sub = bool(g.is_subordinated_bond(bond))
+        eff = data.effective_issuer_rating(gk, bond, upd)
+        sp, mdy = eff.get("sp_token") or "", eff.get("mdy_token") or ""
+        if sub:                                          # mirror _compute_row: no issuer fallback
+            sp = g.parse_rating((upd.get("RatingSP") or "").strip() or (bond.get("SP") or "").strip()) or ""
+            mdy = g.parse_rating((upd.get("RatingMdy") or "").strip() or (bond.get("MDY") or "").strip()) or ""
+        cpn_type = (bond.get("CpnType") or "").strip().lower()
+        fo_type = (bond.get("FOType") or "").strip().lower()
+        floater = cpn_type == "variable" or ("float" in fo_type and cpn_type != "fixed/variable")
+        fixed_to_float = cpn_type == "fixed/variable"
+        rows.append({
+            "isin": isin,
+            "issuer": data.issuer_display_name(gk, fallback=bond.get("IssuerName", "")).strip(),
+            "country": g.country_name(cc) if cc else "",
+            "country_code": cc,
+            "currency": (bond.get("CCY") or "").strip().upper(),
+            "coupon": bond.get("Coupon"),
+            "maturity": bond.get("Maturity"),
+            "price": bond.get("PXASK_ExecDesk"),
+            "yield": bond.get("YLDASK_ExecDesk"),
+            "sp": sp, "moody": mdy,
+            "view": view,
+            "amount": bond.get("AmtOutstanding"),
+            "issuer_type": data.issuer_type(gk) or "",
+            "seniority": "subordinated" if sub else "senior",
+            "floater": floater,
+            "fixed_to_float": fixed_to_float,
+            "top_list": (bond.get("Product_Use") or "").strip() == "7" and rec != "SELL",
+        })
+    df = pd.DataFrame(rows)
+    src = f"{how} on {os.path.basename(os.path.dirname(_abs(cfg['DATA_DIR'])))}/{os.path.basename(_abs(cfg['DATA_DIR']))}"
+    mapping = {"universe": "data.em_bonds + is_offshore_eligible", "price": "PXASK_ExecDesk",
+               "yield": "YLDASK_ExecDesk", "ratings": "effective_issuer_rating", "view": "WMR_Bond_Recommendation"}
     if verbose:
-        print(f"Input : {path}  [sheet: {sheet}, header row {hdr_row + 1}]")
-        print("Columns detected: " + ", ".join(f"{k}<-'{v}'" for k, v in mapping.items()))
-        missing = [f for f in ("isin", "issuer", "country", "coupon", "maturity", "sp", "moody")
-                   if f not in mapping]
-        if missing:
-            print("  ! not detected: " + ", ".join(missing) + "  (use CONFIG['COLUMN_MAP'])")
-    return df, path, mapping
+        print(f"Input : {src}")
+        print(f"Universe: {len(df)} bonds on the published Offshore list ({len(bonds)} in feed)")
+    return df, src, mapping
 
 
 # =============================================================================
@@ -318,8 +411,13 @@ def to_date(x):
     s = str(x).strip()
     if s.upper() in ("PERP", "PERPETUAL", ""):
         return None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):  # feed order
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
     try:
-        return pd.to_datetime(s, dayfirst=False, errors="raise").date()
+        return pd.to_datetime(s, errors="raise").date()
     except Exception:
         return None
 
@@ -439,24 +537,31 @@ def prepare(df, cfg):
     rows, dropped = [], []
     for _, r in df.iterrows():
         r = r.to_dict()
-        isin = str(r.get("isin", "") or "").strip()
-        if not re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin.upper()):
-            continue                                  # section/header/blank rows
-        rec = {"isin": isin.upper(), "issuer": str(r.get("issuer", "")).strip(),
+        isin = str(r.get("isin", "") or "").strip().upper()
+        if not isin:
+            continue
+        rec = {"isin": isin, "issuer": str(r.get("issuer", "")).strip(),
                "country": str(r.get("country", "")).strip(),
-               "currency": str(r.get("currency", "USD") or "USD").strip().upper() if "currency" in df else "USD",
-               "view": str(r.get("view", "") or "").strip() if "view" in df else "",
-               "seniority": str(r.get("seniority", "") or "").strip() if "seniority" in df else ""}
-        if rec["view"].lower() == "nan":
-            rec["view"] = ""
-        if rec["seniority"].lower() == "nan":
-            rec["seniority"] = ""
+               "country_code": str(r.get("country_code", "") or "").strip().upper(),
+               "currency": str(r.get("currency", "USD") or "USD").strip().upper(),
+               "view": str(r.get("view", "") or "").strip(),
+               "seniority": str(r.get("seniority", "") or "").strip(),
+               "issuer_type": str(r.get("issuer_type", "") or "").strip(),
+               "top_list": bool(r.get("top_list", False))}
         coupon, mat = to_float(r.get("coupon")), to_date(r.get("maturity"))
         price, yld = to_float(r.get("price")), to_float(r.get("yield"))
+        if yld is not None and abs(yld) < 1e-6:
+            yld = None                                # feed emits 0 for "no yield"
+        if price is not None and price <= 0:
+            price = None
         sp, mo = notch_sp(r.get("sp")), notch_moody(r.get("moody"))
-        fi = notch_sp(r.get("fitch")) if "fitch" in df else None
+        fi = None
         why = None
-        if mat is None:
+        if r.get("floater", False):
+            why = "floating-rate note (no yield to maturity)"
+        elif r.get("fixed_to_float", False) and not cfg["INCLUDE_FIXED_TO_FLOAT"]:
+            why = "fixed-to-float (yield is to call; INCLUDE_FIXED_TO_FLOAT=False)"
+        elif mat is None:
             why = "perpetual / no maturity"
         elif coupon is None:
             why = "missing coupon (floater?)"
@@ -470,7 +575,8 @@ def prepare(df, cfg):
         if why is None and yld is None and price is None:
             why = "no price or yield"
         if why:
-            dropped.append({**rec, "reason": why})
+            dropped.append({"isin": rec["isin"], "issuer": rec["issuer"], "country": rec["country"],
+                            "country_code": rec["country_code"], "reason": why})
             continue
         if yld is not None and abs(yld) < 1.0 and yld != 0:     # given as decimal
             yld *= 100
@@ -478,21 +584,22 @@ def prepare(df, cfg):
             yld = yield_from_price(coupon, t, price) * 100
         if price is None:
             price = bond_price(coupon, t, yld / 100) - accrued(coupon, t)
-        amt = to_float(r.get("amount")) if "amount" in df else None
+        amt = to_float(r.get("amount"))
         if amt is not None and amt > 1e5:
             amt /= 1e6
+        itype = rec["issuer_type"].upper()
         rec.update(coupon=coupon, maturity=mat, years=t, price=price, yield_pct=yld,
                    notch=n, rating=notch_to_label(n), sp=r.get("sp"), moody=r.get("moody"),
-                   grade=grade_bucket(n), amount_mm=amt,
-                   call_date=to_date(r.get("call_date")) if "call_date" in df else None,
-                   sovereign=is_sovereign(r), country_key=norm_country(rec["country"]))
+                   grade=grade_bucket(n), amount_mm=amt, call_date=None,
+                   sovereign=(itype == "SOV") if itype else is_sovereign(r),
+                   country_key=rec["country_code"] or norm_country(rec["country"]))
         rows.append(rec)
     u = pd.DataFrame(rows)
     if cfg["CURRENCY"] != "all" and len(u):
         off = u[u.currency != cfg["CURRENCY"].upper()]
         for _, x in off.iterrows():
             dropped.append({"isin": x["isin"], "issuer": x.issuer, "country": x.country,
-                            "reason": f"currency {x.currency}"})
+                            "reason": "currency " + str(x.currency)})
         u = u[u.currency == cfg["CURRENCY"].upper()].reset_index(drop=True)
     return u, pd.DataFrame(dropped), as_of
 
@@ -912,7 +1019,9 @@ def run(cfg, select, label, verbose=True):
                             curve_info.curve.str.startswith("[country]") &
                             curve_info.curve.str.contains("|".join(re.escape(c) for c in set(targets.country_key)))]
     tgt_isins = set(targets["isin"])
-    dropped_rel = dropped[dropped.country.map(norm_country).isin(set(targets.country_key))] if len(dropped) else dropped
+    tgt_countries = set(targets.country_key) | set(targets.country.map(norm_country))
+    dropped_rel = dropped[dropped.country.map(norm_country).isin(tgt_countries) |
+                          dropped.get("country_code", pd.Series("", index=dropped.index)).isin(tgt_countries)] if len(dropped) else dropped
     name = cfg.get("OUTPUT_NAME") or f"Best_Bonds_{label.replace(' ', '_')}_{as_of:%Y%m%d}.xlsx"
     out = os.path.join(cfg["OUTPUT_DIR"], name)
     write_excel(out, cfg, results, picks, peer_tables, curve_info, dropped_rel, as_of, src, mapping,
@@ -927,39 +1036,48 @@ def run(cfg, select, label, verbose=True):
     return out, results, picks
 
 
+def _country_selector(cfg, wanted_names):
+    """Match CONFIG countries given as names ('Mexico') or ISO codes ('MX') against the feed."""
+    wanted = {norm_country(c) for c in wanted_names}
+    codes = {c.upper() for c in wanted_names if len(c) == 2}
+
+    def select(s):
+        by_name = s.country.map(norm_country).isin(wanted)
+        by_code = s.country_key.isin(codes) if codes else False
+        m = by_name | by_code
+        if cfg["UNIVERSE"] == "sovereign":
+            m &= s.sovereign
+        return m
+    return select
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--country", action="append")
-    ap.add_argument("--data")
+    ap.add_argument("--data", help="feed folder (data/current)")
     ap.add_argument("--universe", choices=["sovereign", "all"])
     ap.add_argument("--ccy")
     ap.add_argument("--as-of")
     ap.add_argument("--out")
-    ap.add_argument("--show-columns", action="store_true")
+    ap.add_argument("--show-universe", action="store_true")
     a = ap.parse_args()
     cfg = dict(CONFIG)
     if a.country: cfg["COUNTRIES"] = a.country
-    if a.data: cfg["DATA_PATH"] = a.data
+    if a.data: cfg["DATA_DIR"] = a.data
     if a.universe: cfg["UNIVERSE"] = a.universe
     if a.ccy: cfg["CURRENCY"] = a.ccy
     if a.as_of: cfg["AS_OF"] = a.as_of
     if a.out: cfg["OUTPUT_NAME"] = a.out
-    if a.show_columns:
-        load_universe(cfg); return
+    if a.show_universe:
+        df, _, _ = load_universe(cfg)
+        print(df.groupby(["country", "issuer_type"]).size().to_string())
+        return
 
-    wanted = {norm_country(c) for c in cfg["COUNTRIES"]}
-
-    def select(s):
-        m = s.country_key.isin(wanted)
-        if cfg["UNIVERSE"] == "sovereign":
-            m &= s.sovereign
-        return m
-
-    found = set()
-    out, results, _ = run(cfg, select, "-".join(cfg["COUNTRIES"]))
-    found = set(results.country_key)
-    for c in wanted - found:
-        print(f"  ! no {cfg['UNIVERSE']} bonds found for '{c}' — check spelling / --universe all")
+    out, results, _ = run(cfg, _country_selector(cfg, cfg["COUNTRIES"]), "-".join(cfg["COUNTRIES"]))
+    found = set(results.country.map(norm_country)) | set(results.country_key)
+    for c in cfg["COUNTRIES"]:
+        if norm_country(c) not in found and c.upper() not in found:
+            print(f"  ! no {cfg['UNIVERSE']} USD bonds found for '{c}' - check spelling / --universe all")
 
 
 if __name__ == "__main__":
