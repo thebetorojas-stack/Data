@@ -99,8 +99,9 @@ CONFIG = {
     "SMALL_ISSUE_PENALTY_BP": 25,
     "SUBORDINATED_PENALTY_BP": 50,
 
-    "BUCKETS": [("Short (<3y)", 0, 3), ("Belly (3-7y)", 3, 7),
-                ("Intermediate (7-12y)", 7, 12), ("Long (12y+)", 12, 99)],
+    # Tenor buckets used by the "By Tenor" tab and the bucket picks
+    "BUCKETS": [("Front end (<5y)", 0, 5), ("Belly (5-10y)", 5, 10), ("Long end (10y+)", 10, 99)],
+    "TOP_N_PER_BUCKET": 3,
 }
 
 # Approximate long-run 1-year default probabilities by composite notch (%),
@@ -710,7 +711,16 @@ def benchmark(scored, targets, cfg):
     res["score_bp"] = (w["base"] * res.xs_base_bp + w["rally"] * res.xs_rally_bp
                        + w["selloff"] * res.xs_selloff_bp) / sum(w.values()) - res.penalty_bp
     res["robust"] = (res.xs_base_bp > 0) & (res.xs_rally_bp > 0) & (res.xs_selloff_bp > 0)
-    res["bucket"] = res.years.apply(lambda t: next((n for n, lo, hi in cfg["BUCKETS"] if lo <= t < hi), "Long"))
+    res["bucket"] = res.years.apply(lambda t: next((n for n, lo, hi in cfg["BUCKETS"] if lo <= t < hi), "Long end"))
+    # Rank 1 = best score on its curve (unbenchmarkable bonds last); overall rank across everything analysed
+    excl = [v.lower() for v in cfg["EXCLUDE_VIEWS"]]
+    res["eligible"] = ~res.view.str.lower().isin(excl) & res.peer_tr_base.notna()
+    order = res.score_bp.where(res.eligible, -1e9).fillna(-1e9)
+    res["rank_curve"] = order.groupby(res.curve_key).rank(ascending=False, method="first").astype(int)
+    res["rank_all"] = order.rank(ascending=False, method="first").astype(int)
+    rb = order.groupby([res.curve_key, res.bucket]).rank(ascending=False, method="first").astype(int)
+    res["rank_bucket"] = rb.where(res.eligible)
+    res["beats_peers"] = res.xs_base_bp.apply(lambda x: "" if pd.isna(x) else ("Yes" if x > cfg["MIN_EXCESS_BP"] else "No"))
     return res, peer_tables
 
 
@@ -881,6 +891,82 @@ def write_excel(path, cfg, results, picks, peer_tables, curve_info, dropped, as_
         for k, name in enumerate(no_pick, 1):
             ws.cell(row=r0 + k, column=1, value=name).font = body
 
+    # ---- By Tenor: best front end / belly / long end per curve --------------
+    ws = wb.create_sheet("By Tenor")
+    sheet_title(ws, "Best bonds by tenor — front end, belly, long end",
+                f"Per curve, top {cfg['TOP_N_PER_BUCKET']} by score in each tenor bucket. "
+                "Green = beats the peer median; orange = best available but trails peers. Sell-rated bonds excluded.")
+    tcols = [("Curve", "curve_key", None), ("Tenor", "bucket", None), ("# in tenor", "rank_bucket", "0"),
+             ("ISIN", "isin", None), ("Coupon", "coupon", "0.000"), ("Maturity", "maturity", D),
+             ("Years", "years", "0.0"), ("Rating", "rating", None), ("Price", "price", "0.00"),
+             ("Yield %", "yield_pct", P2), ("Mod dur", "mod_dur", "0.0"), ("12m TR base", "tr_base", P),
+             ("Peer median TR", "peer_tr_base", P), ("Excess vs peers bp", None, BP),
+             ("Beats peers?", "beats_peers", None), ("Excess sell-off bp", None, BP),
+             ("Score bp", "score_bp", BP), ("Rank on curve", "rank_curve", "0"), ("Why", "why", None)]
+    txs = {"Excess vs peers bp": ("12m TR base", "Peer median TR"),
+           "Excess sell-off bp": ("TR sell-off", "Peer TR sell-off")}
+    # sell-off excess needs its inputs present; write them as hidden helper columns
+    tcols_full = tcols + [("TR sell-off", "tr_selloff", P), ("Peer TR sell-off", "peer_tr_selloff", P)]
+    trows = []
+    bucket_order = {n: i for i, (n, _, _) in enumerate(cfg["BUCKETS"])}
+    elig = results[results.eligible].copy()
+    elig["why"] = elig.apply(lambda b: explain(b, cfg), axis=1)
+    for curve, g in elig.groupby("curve_key", sort=True):
+        for bname, _, _ in cfg["BUCKETS"]:
+            gb = g[g.bucket == bname].sort_values("score_bp", ascending=False).head(cfg["TOP_N_PER_BUCKET"])
+            if gb.empty:
+                trows.append({"curve_key": curve, "bucket": bname, "why": "no eligible bond in this tenor"})
+            else:
+                trows += gb.to_dict("records")
+    pos = table(ws, 4, tcols_full, trows, widths={"Curve": 28, "Tenor": 16, "Why": 90}, xs_formula=txs)
+    for col in ("TR sell-off", "Peer TR sell-off"):
+        ws.column_dimensions[pos[col]].hidden = True
+    prev_curve = None
+    for i, r in enumerate(trows, 5):
+        ws.row_dimensions[i].height = 60 if r.get("isin") else 18
+        bp = r.get("beats_peers")
+        if bp == "Yes":
+            ws.cell(row=i, column=4).fill = good
+        elif bp == "No":
+            ws.cell(row=i, column=4).fill = bad
+        if r.get("rank_bucket") == 1:
+            for j in range(1, 4):
+                ws.cell(row=i, column=j).font = bold
+        if r["curve_key"] != prev_curve and prev_curve is not None:
+            for j in range(1, len(tcols_full) + 1):
+                ws.cell(row=i, column=j).border = Border(top=Side(style="medium", color=GREY))
+        prev_curve = r["curve_key"]
+
+    # ---- Ranking: every bond by maturity, with its rank ------------------------
+    ws = wb.create_sheet("Ranking")
+    sheet_title(ws, "All bonds by maturity, with rank (1 = best)",
+                "Rank = position by score on its own curve; Overall rank = across every curve in this file. "
+                "Sell-rated or unbenchmarkable bonds rank last.")
+    rcols = [("Curve", "curve_key", None), ("Rank", "rank_curve", "0"), ("Overall rank", "rank_all", "0"),
+             ("ISIN", "isin", None), ("Coupon", "coupon", "0.000"), ("Maturity", "maturity", D),
+             ("Years", "years", "0.0"), ("Tenor", "bucket", None), ("Rating", "rating", None),
+             ("Price", "price", "0.00"), ("Yield %", "yield_pct", P2), ("12m TR base", "tr_base", P),
+             ("Peer median TR", "peer_tr_base", P), ("Excess vs peers bp", None, BP),
+             ("Beats peers?", "beats_peers", None), ("All 3 scenarios", "robust", None),
+             ("Score bp", "score_bp", BP), ("CIO view", "view", None), ("Flags", "call_flag", None)]
+    rrows = results.sort_values(["curve_key", "maturity"]).to_dict("records")
+    table(ws, 4, rcols, rrows, widths={"Curve": 28, "Tenor": 16},
+          xs_formula={"Excess vs peers bp": ("12m TR base", "Peer median TR")})
+    prev_curve = None
+    for i, r in enumerate(rrows, 5):
+        if r["rank_curve"] == 1 and r["eligible"]:
+            for j in range(1, 5):
+                ws.cell(row=i, column=j).fill = good
+                ws.cell(row=i, column=j).font = bold
+        elif r["rank_curve"] <= 3 and r["eligible"]:
+            ws.cell(row=i, column=2).fill = good
+        elif not r["eligible"]:
+            ws.cell(row=i, column=2).fill = bad
+        if r["curve_key"] != prev_curve and prev_curve is not None:
+            for j in range(1, len(rcols) + 1):
+                ws.cell(row=i, column=j).border = Border(top=Side(style="medium", color=GREY))
+        prev_curve = r["curve_key"]
+
     # ---- Best picks -------------------------------------------------------
     ws = wb.create_sheet("Best Picks")
     sheet_title(ws, "Best picks per curve and per maturity bucket", "Why = generated explanation. Excess bp columns are live formulas.")
@@ -979,6 +1065,8 @@ def write_excel(path, cfg, results, picks, peer_tables, curve_info, dropped, as_
     ws.column_dimensions["A"].width = 18
     ws.column_dimensions["B"].width = 130
 
+    order = ["Summary", "By Tenor", "Ranking", "Best Picks"]
+    wb._sheets = [wb[n] for n in order] + [ws for ws in wb._sheets if ws.title not in order]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     wb.save(path)
     return path
