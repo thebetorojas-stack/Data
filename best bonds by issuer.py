@@ -20,7 +20,21 @@ ISSUER = "Petroleos Mexicanos"      # <-- CHANGE THIS
 # =============================================================================
 
 EXACT_MATCH = False                 # True = full name must match exactly
-DATA_PATH = None                    # None = use DATA_PATH from best_bonds_by_country.CONFIG
+
+# Short names people actually use -> wording in the feed's issuer name
+ISSUER_ALIASES = {
+    "pemex": "Petroleos Mexicanos",
+    "cfe": "Comision Federal de Electricidad",
+    "petrobras": "Petrobras",
+    "ecopetrol": "Ecopetrol",
+    "codelco": "Codelco",
+    "ypf": "YPF",
+    "argentina": "Republic of Argentina",
+    "mexico": "United Mexican States",
+    "brazil": "Federative Republic of Brazil",
+    "chile": "Republic of Chile",
+}
+DATA_DIR = None                     # None = use DATA_DIR from best_bonds_by_country.CONFIG
 CURRENCY = None                     # None = same as the country script ("USD")
 
 import argparse
@@ -38,13 +52,14 @@ def main():
 
     cfg = dict(eng.CONFIG)
     cfg["UNIVERSE"] = "all"           # an issuer can be a corporate or quasi
-    if DATA_PATH:
-        cfg["DATA_PATH"] = DATA_PATH
+    if DATA_DIR:
+        cfg["DATA_DIR"] = DATA_DIR
     if a.data:
-        cfg["DATA_PATH"] = a.data
+        cfg["DATA_DIR"] = a.data
     if CURRENCY:
         cfg["CURRENCY"] = CURRENCY
     issuer = (a.issuer or ISSUER).strip()
+    issuer = ISSUER_ALIASES.get(issuer.lower(), issuer)
 
     if a.list is not None:
         raw, _, _ = eng.load_universe(cfg)
